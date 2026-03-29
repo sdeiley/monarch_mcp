@@ -1,6 +1,6 @@
 # Monarch MCP Server
 
-Standalone MCP server for Monarch Money personal finance data. Extracted from [monarch_chrome_extension](https://github.com/sdeiley/monarch_chrome_extension).
+Standalone MCP server for Monarch Money personal finance data.
 
 ## Repository Structure
 
