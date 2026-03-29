@@ -1,0 +1,17 @@
+{
+  "name": "monarch-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Monarch Money personal finance data",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "monarch-mcp": "./src/bin/cli.js"
+  },
+  "scripts": {
+    "test": "node --test test/**/*.test.js"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
