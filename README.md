@@ -4,6 +4,19 @@ MCP server for querying and managing [Monarch Money](https://www.monarch.com/) p
 
 Provides read-only SQL access to your transactions via a local SQLite mirror, plus a refresh tool to sync from the Monarch API. Works with Claude Code, Claude Desktop, and any MCP-compatible client.
 
+## What Makes This Different
+
+Most Monarch Money MCP servers are **API passthroughs** — each tool call hits the live Monarch API and returns the full response. This server takes a fundamentally different approach:
+
+- **Local SQLite mirror** — transactions are synced to a local database, so queries are instant with zero API latency. No other Monarch MCP does this.
+- **Arbitrary SQL** — instead of fixed-parameter tools like `get_transactions(start_date, end_date, limit)`, you get `query_transactions(sql)` and can write any SELECT query: JOINs, CTEs, window functions, aggregations. The AI writes the query it needs, not the query a tool designer anticipated.
+- **MCP Resources** — the only Monarch MCP that exposes schema, accounts, categories, and tags as MCP resources. This gives AI clients the metadata they need to write good queries without burning tool calls.
+- **Token-efficient** — pre-computed resources and SQL-level filtering mean only relevant data crosses the wire. Other servers return full API payloads on every call.
+- **Zero native dependencies** — uses Node.js built-in `node:sqlite`, no compiled extensions. Just `npm install` and go.
+- **62 tests** — fixture-based test suite with no dependency on real financial data.
+
+**Trade-off:** This server focuses on transaction analysis (read-only SQL). For budgets, investments, cashflow, or write operations, pair it with an API-passthrough MCP like [robcerda/monarch-mcp-server](https://github.com/robcerda/monarch-mcp-server).
+
 ## Requirements
 
 - Node.js >= 22.0.0 (uses `node:sqlite`)
