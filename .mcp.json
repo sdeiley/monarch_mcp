@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "monarch": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "src/bin/stdio.js"
+      ],
+      "env": {}
+    }
+  }
+}
