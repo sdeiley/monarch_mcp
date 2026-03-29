@@ -9,6 +9,9 @@ node_modules/
 # Data directory (safety net against committing live financial data)
 data/
 
+# Third-party MCP servers (local clones, not part of this repo)
+others/
+
 # OS files
 .DS_Store
 Thumbs.db
