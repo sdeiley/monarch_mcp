@@ -329,4 +329,148 @@ function registerWriteTools(server) {
       return api.setTransactionTags(token, transactionId, tagIds);
     })
   );
+
+  registerRuleTools(server);
+}
+
+// ─── Rule tools (TransactionRuleV2 CRUD) ────────────────────────────────
+
+const ruleCriteriaSchema = z.object({
+  operator: z.enum(['contains', 'eq']),
+  value: z.string(),
+});
+
+/** Shared criteria + action fields for create_rule / update_rule. */
+const ruleFieldsSchema = {
+  // Filter criteria
+  merchantNameCriteria: z.array(ruleCriteriaSchema).optional()
+    .describe('Match on merchant display name'),
+  originalStatementCriteria: z.array(ruleCriteriaSchema).optional()
+    .describe('Match on raw bank statement text'),
+  amountCriteria: z.object({
+    operator: z.enum(['eq', 'gt', 'lt', 'between']),
+    isExpense: z.boolean(),
+    value: z.number().nullable().optional(),
+    valueRange: z.object({ lower: z.number(), upper: z.number() }).nullable().optional()
+      .describe('Required when operator is "between"'),
+  }).optional(),
+  categoryIds: z.array(z.string()).optional()
+    .describe('Only apply to transactions currently in these categories'),
+  accountIds: z.array(z.string()).optional()
+    .describe('Only apply to transactions in these accounts'),
+
+  // Actions
+  setCategoryAction: z.string().optional().describe('Category ID to assign'),
+  setMerchantAction: z.string().optional().describe('Merchant ID to assign (renames the transaction)'),
+  addTagsAction: z.array(z.string()).optional().describe('Tag IDs to add'),
+  reviewStatusAction: z.enum(['reviewed', 'needs_review']).optional(),
+  setHideFromReportsAction: z.boolean().optional(),
+  splitTransactionsAction: z.object({
+    amountType: z.enum(['PERCENTAGE', 'ABSOLUTE'])
+      .describe('PERCENTAGE splits use decimal fractions summing to 1.0; ABSOLUTE splits use dollar amounts (negative for expenses) and require amountCriteria with operator "eq"'),
+    splitsInfo: z.array(z.object({
+      merchantName: z.string(),
+      categoryId: z.string(),
+      amount: z.number(),
+      tags: z.array(z.string()).nullable().optional(),
+      hideFromReports: z.boolean().optional(),
+      reviewStatus: z.string().nullable().optional(),
+    })),
+  }).optional(),
+  applyToExistingTransactions: z.boolean().optional()
+    .describe('Apply the rule retroactively to existing transactions'),
+};
+
+const RULE_CRITERIA_KEYS = [
+  'merchantNameCriteria', 'originalStatementCriteria', 'amountCriteria',
+  'categoryIds', 'accountIds',
+];
+const RULE_ACTION_KEYS = [
+  'setCategoryAction', 'setMerchantAction', 'addTagsAction',
+  'reviewStatusAction', 'setHideFromReportsAction', 'splitTransactionsAction',
+];
+
+/** Copy only defined rule fields from tool args into a mutation input. */
+function pickRuleInput(args) {
+  const input = {};
+  for (const key of [...RULE_CRITERIA_KEYS, ...RULE_ACTION_KEYS, 'applyToExistingTransactions']) {
+    if (args[key] !== undefined) input[key] = args[key];
+  }
+  return input;
+}
+
+function registerRuleTools(server) {
+
+  server.registerTool(
+    'list_rules',
+    {
+      description: 'List all Monarch transaction rules (TransactionRuleV2) from the live API, ' +
+        'including criteria, actions, and application stats. Read-only. ' +
+        'Use this to find rule IDs for update_rule/delete_rule.',
+      inputSchema: z.object({}),
+    },
+    writeHandler(async (token) => {
+      return api.getRules(token);
+    })
+  );
+
+  server.registerTool(
+    'create_rule',
+    {
+      description: 'Create a Monarch transaction rule that auto-applies actions (set category, ' +
+        'add tags, rename, hide, split) to transactions matching criteria (merchant name, ' +
+        'statement text, amount, category, account). Requires at least one criteria field and ' +
+        'one action field. The API returns no rule entity on success — call list_rules to see ' +
+        'the created rule.' +
+        WRITE_WARNING,
+      inputSchema: z.object(ruleFieldsSchema),
+    },
+    writeHandler(async (token, args) => {
+      const input = pickRuleInput(args);
+      if (!RULE_CRITERIA_KEYS.some(k => input[k] !== undefined)) {
+        throw new Error(
+          'At least one criteria field is required: merchantNameCriteria, originalStatementCriteria, amountCriteria, categoryIds, or accountIds.'
+        );
+      }
+      if (!RULE_ACTION_KEYS.some(k => input[k] !== undefined)) {
+        throw new Error(
+          'At least one action field is required: setCategoryAction, setMerchantAction, addTagsAction, reviewStatusAction, setHideFromReportsAction, or splitTransactionsAction.'
+        );
+      }
+      return api.createRule(token, input);
+    })
+  );
+
+  server.registerTool(
+    'update_rule',
+    {
+      description: 'Update an existing Monarch transaction rule by ID. Provide the fields to ' +
+        'change (same shape as create_rule). Note: action fields read as objects via list_rules ' +
+        'but are written as bare ID strings here. The API returns no rule entity on success — ' +
+        'call list_rules to confirm.' +
+        WRITE_WARNING,
+      inputSchema: z.object({
+        id: z.string().describe('Rule ID (from list_rules)'),
+        ...ruleFieldsSchema,
+      }),
+    },
+    writeHandler(async (token, args) => {
+      const input = { id: args.id, ...pickRuleInput(args) };
+      return api.updateRule(token, input);
+    })
+  );
+
+  server.registerTool(
+    'delete_rule',
+    {
+      description: 'Delete a Monarch transaction rule by ID.' + WRITE_WARNING,
+      inputSchema: z.object({
+        id: z.string().describe('Rule ID (from list_rules)'),
+      }),
+    },
+    writeHandler(async (token, { id }) => {
+      const deleted = await api.deleteRule(token, id);
+      return { deleted };
+    })
+  );
 }

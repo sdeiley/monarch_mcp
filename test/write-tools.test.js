@@ -409,3 +409,117 @@ describe('set_transaction_tags tool', () => {
     assert.match(result.content[0].text, /Tag not found/);
   });
 });
+
+describe('rule tools', () => {
+  let client, close, calls, originalFetch;
+
+  before(async () => { ({ client, close } = await createTestPair()); });
+  after(async () => { await close(); });
+  beforeEach(() => { calls = []; originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it('list_rules returns all transaction rules from the live API', async () => {
+    installMockFetch(calls, {
+      transactionRules: [
+        { id: 'r1', order: 0, merchantNameCriteria: [{ operator: 'contains', value: 'Apple' }], setCategoryAction: { id: 'c1', name: 'Software' } },
+      ],
+    });
+
+    const result = await client.callTool({ name: 'list_rules', arguments: {} });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    const rules = JSON.parse(result.content[0].text);
+    assert.equal(rules.length, 1);
+    assert.equal(rules[0].id, 'r1');
+  });
+
+  it('create_rule requires at least one criteria and one action', async () => {
+    installMockFetch(calls, {});
+
+    const noCriteria = await client.callTool({
+      name: 'create_rule',
+      arguments: { setCategoryAction: 'cat-1' },
+    });
+    assert.ok(noCriteria.isError, 'should error without criteria');
+
+    const noAction = await client.callTool({
+      name: 'create_rule',
+      arguments: { merchantNameCriteria: [{ operator: 'contains', value: 'Apple' }] },
+    });
+    assert.ok(noAction.isError, 'should error without an action');
+
+    assert.equal(calls.length, 0, 'must not hit the API');
+  });
+
+  it('create_rule passes criteria and actions through to the mutation input', async () => {
+    installMockFetch(calls, { createTransactionRuleV2: { errors: null } });
+
+    const result = await client.callTool({
+      name: 'create_rule',
+      arguments: {
+        merchantNameCriteria: [{ operator: 'contains', value: 'Apple' }],
+        amountCriteria: { operator: 'eq', isExpense: true, value: 9.99 },
+        setCategoryAction: 'cat-1',
+        addTagsAction: ['tag-1'],
+        applyToExistingTransactions: true,
+      },
+    });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    assert.match(calls[0].body.query, /Common_CreateTransactionRuleMutationV2/);
+    assert.deepEqual(calls[0].body.variables.input, {
+      merchantNameCriteria: [{ operator: 'contains', value: 'Apple' }],
+      amountCriteria: { operator: 'eq', isExpense: true, value: 9.99 },
+      setCategoryAction: 'cat-1',
+      addTagsAction: ['tag-1'],
+      applyToExistingTransactions: true,
+    });
+  });
+
+  it('create_rule surfaces payload errors as tool errors', async () => {
+    installMockFetch(calls, {
+      createTransactionRuleV2: {
+        errors: [{ message: 'Invalid split configuration', code: 'invalid', fieldErrors: null }],
+      },
+    });
+
+    const result = await client.callTool({
+      name: 'create_rule',
+      arguments: {
+        merchantNameCriteria: [{ operator: 'eq', value: 'X' }],
+        setCategoryAction: 'cat-1',
+      },
+    });
+
+    assert.ok(result.isError, 'should be an error');
+    assert.match(result.content[0].text, /Invalid split configuration/);
+  });
+
+  it('update_rule sends the rule id with updated fields', async () => {
+    installMockFetch(calls, { updateTransactionRuleV2: { errors: null } });
+
+    const result = await client.callTool({
+      name: 'update_rule',
+      arguments: { id: 'r1', setCategoryAction: 'cat-2' },
+    });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    assert.match(calls[0].body.query, /Common_UpdateTransactionRuleMutationV2/);
+    assert.deepEqual(calls[0].body.variables.input, { id: 'r1', setCategoryAction: 'cat-2' });
+  });
+
+  it('delete_rule deletes by id and reports deletion', async () => {
+    installMockFetch(calls, { deleteTransactionRule: { deleted: true, errors: null } });
+
+    const result = await client.callTool({
+      name: 'delete_rule',
+      arguments: { id: 'r1' },
+    });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    assert.match(calls[0].body.query, /Common_DeleteTransactionRule/);
+    assert.deepEqual(calls[0].body.variables, { id: 'r1' });
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.deleted, true);
+  });
+});

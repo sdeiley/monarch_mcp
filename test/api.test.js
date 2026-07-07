@@ -263,4 +263,72 @@ describe('Monarch API write client', () => {
       assert.equal(txn.amount, -15.50);
     });
   });
+
+  describe('rules', () => {
+    it('getRules queries transactionRules', async () => {
+      mockFetch({
+        transactionRules: [{ id: 'r1', order: 0, merchantNameCriteria: [{ operator: 'contains', value: 'Apple' }] }],
+      });
+
+      const rules = await api.getRules(FAKE_TOKEN);
+
+      assert.match(lastCall().body.query, /transactionRules/);
+      assert.equal(rules.length, 1);
+      assert.equal(rules[0].id, 'r1');
+    });
+
+    it('createRule sends Common_CreateTransactionRuleMutationV2 with input', async () => {
+      mockFetch({ createTransactionRuleV2: { errors: null } });
+
+      const input = {
+        merchantNameCriteria: [{ operator: 'contains', value: 'Apple' }],
+        setCategoryAction: 'cat-1',
+        applyToExistingTransactions: false,
+      };
+      const result = await api.createRule(FAKE_TOKEN, input);
+
+      const { body } = lastCall();
+      assert.match(body.query, /mutation Common_CreateTransactionRuleMutationV2\(\$input: CreateTransactionRuleInput!\)/);
+      assert.match(body.query, /createTransactionRuleV2\(input: \$input\)/);
+      assert.deepEqual(body.variables, { input });
+      assert.deepEqual(result, { created: true });
+    });
+
+    it('createRule throws on payload errors', async () => {
+      mockFetch({
+        createTransactionRuleV2: {
+          errors: [{ message: 'Invalid criteria', code: 'invalid', fieldErrors: null }],
+        },
+      });
+
+      await assert.rejects(
+        () => api.createRule(FAKE_TOKEN, {}),
+        /createRule failed: Invalid criteria/
+      );
+    });
+
+    it('updateRule sends Common_UpdateTransactionRuleMutationV2 with id in input', async () => {
+      mockFetch({ updateTransactionRuleV2: { errors: null } });
+
+      const input = { id: 'r1', setCategoryAction: 'cat-2' };
+      const result = await api.updateRule(FAKE_TOKEN, input);
+
+      const { body } = lastCall();
+      assert.match(body.query, /mutation Common_UpdateTransactionRuleMutationV2\(\$input: UpdateTransactionRuleInput!\)/);
+      assert.deepEqual(body.variables, { input });
+      assert.deepEqual(result, { updated: true });
+    });
+
+    it('deleteRule sends Common_DeleteTransactionRule with the rule id', async () => {
+      mockFetch({ deleteTransactionRule: { deleted: true, errors: null } });
+
+      const deleted = await api.deleteRule(FAKE_TOKEN, 'r1');
+
+      const { body } = lastCall();
+      assert.match(body.query, /mutation Common_DeleteTransactionRule\(\$id: ID!\)/);
+      assert.match(body.query, /deleteTransactionRule\(id: \$id\)/);
+      assert.deepEqual(body.variables, { id: 'r1' });
+      assert.equal(deleted, true);
+    });
+  });
 });
