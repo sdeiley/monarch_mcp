@@ -11,6 +11,10 @@ import { queryDb, getSchema } from './db.js';
 import { loadToken } from './token.js';
 import { refreshDb } from './refresh.js';
 import * as api from './api.js';
+import {
+  openQueueDb, listRecords, getRecord, getStatsData,
+  updateStatus, applyRecord, sweep, QUEUE_STATUSES,
+} from './queue.js';
 
 export const SERVER_NAME = 'monarch-money';
 export const SERVER_VERSION = '0.3.0';
@@ -47,9 +51,12 @@ function writeHandler(fn) {
 /**
  * Create and configure the MCP server instance.
  * Resources and tools are registered here; transport is handled by the caller.
+ * @param {{queueDb?: import('node:sqlite').DatabaseSync}} [options]
+ *   queueDb: injectable queue database handle (tests pass ':memory:');
+ *   defaults to lazily opening <dataDir>/queue.db on first queue tool use.
  * @returns {McpServer}
  */
-export function createServer() {
+export function createServer(options = {}) {
   const server = new McpServer(
     {
       name: SERVER_NAME,
@@ -76,15 +83,33 @@ export function createServer() {
     }
   );
 
-  registerResources(server);
-  registerTools(server);
+  // Queue database: injected in tests, opened lazily (created on first
+  // access) in production so a missing queue.db never crashes the server.
+  let queueDb = options.queueDb ?? null;
+  const getQueueDb = () => (queueDb ??= openQueueDb());
+
+  registerResources(server, getQueueDb);
+  registerTools(server, getQueueDb);
 
   return server;
 }
 
 // ─── Resources ─────────────────────────────────────────────────────────
 
-function registerResources(server) {
+function registerResources(server, getQueueDb) {
+
+  server.registerResource(
+    'queue-stats',
+    'monarch://queue/stats',
+    {
+      description: 'Recommendation queue stats: counts by status/type/merchant and lastGeneratedAt',
+      mimeType: 'application/json',
+    },
+    async (uri) => {
+      const stats = getStatsData(getQueueDb());
+      return { contents: [{ uri: uri.href, text: JSON.stringify(stats) }] };
+    }
+  );
 
   server.registerResource(
     'schema',
@@ -164,7 +189,7 @@ function registerResources(server) {
 
 // ─── Tools ──────────────────────────────────────────────────────────────
 
-function registerTools(server) {
+function registerTools(server, getQueueDb) {
 
   server.registerTool(
     'query_transactions',
@@ -220,6 +245,74 @@ function registerTools(server) {
   );
 
   registerWriteTools(server);
+  registerQueueTools(server, getQueueDb);
+}
+
+// ─── Queue tools (recommendation queue, Track B3) ────────────────────────
+
+const EMPTY_QUEUE_MESSAGE =
+  'The recommendation queue is empty — no recommendations have been captured yet. ' +
+  'Records are produced by the browser extension pipeline (queue.db in the Monarch data directory).';
+
+/** Wrap a queue tool handler with uniform JSON/error formatting. */
+function queueHandler(fn) {
+  return async (args) => {
+    try {
+      const result = await fn(args);
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    } catch (err) {
+      return { isError: true, content: [{ type: 'text', text: err.message }] };
+    }
+  };
+}
+
+function registerQueueTools(server, getQueueDb) {
+
+  server.registerTool(
+    'queue_list',
+    {
+      description: 'List recommendation-queue records (extension-generated proposals to split, ' +
+        'rename, categorize, or tag Monarch transactions). Returns matching items plus overall ' +
+        'counts by status. Present pending items to the user grouped by group_key before applying.',
+      inputSchema: z.object({
+        status: z.enum(QUEUE_STATUSES).optional().describe('Filter by lifecycle status'),
+        type: z.string().optional().describe("Filter by record type, e.g. 'split', 'categorize', 'rename'"),
+        merchant: z.string().optional().describe("Filter by source merchant, e.g. 'apple'"),
+        min_confidence: z.number().min(0).max(1).optional().describe('Minimum confidence (0-1)'),
+        limit: z.number().int().positive().max(200).default(50),
+      }),
+    },
+    queueHandler(({ status, type, merchant, min_confidence, limit }) => {
+      const { items, counts } = listRecords(getQueueDb(), {
+        status, type, merchant, minConfidence: min_confidence, limit,
+      });
+      const result = { items, counts };
+      if (items.length === 0) {
+        result.message = Object.keys(counts).length === 0
+          ? EMPTY_QUEUE_MESSAGE
+          : 'No recommendations match the given filters.';
+      }
+      return result;
+    })
+  );
+
+  server.registerTool(
+    'queue_get',
+    {
+      description: 'Fetch a single recommendation-queue record by id, including its full payload ' +
+        '(source invoice data, captured target transaction, proposed diff, and reasoning).',
+      inputSchema: z.object({
+        id: z.string().describe('Recommendation id (from queue_list)'),
+      }),
+    },
+    queueHandler(({ id }) => {
+      const record = getRecord(getQueueDb(), id);
+      if (!record) {
+        throw new Error(`Recommendation '${id}' not found in the queue`);
+      }
+      return record;
+    })
+  );
 }
 
 // ─── Write tools (live Monarch API mutations) ───────────────────────────

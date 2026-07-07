@@ -30,15 +30,16 @@ describe('MCP Resources registration', () => {
 
   after(async () => { await close(); });
 
-  it('lists all four expected resources', async () => {
+  it('lists all five expected resources', async () => {
     const result = await client.listResources();
     const uris = result.resources.map(r => r.uri);
 
+    assert.ok(uris.includes('monarch://queue/stats'), 'should have queue stats resource');
     assert.ok(uris.includes('monarch://accounts'), 'should have accounts resource');
     assert.ok(uris.includes('monarch://categories'), 'should have categories resource');
     assert.ok(uris.includes('monarch://tags'), 'should have tags resource');
     assert.ok(uris.includes('monarch://schema'), 'should have schema resource');
-    assert.equal(result.resources.length, 4, 'should have exactly 4 resources');
+    assert.equal(result.resources.length, 5, 'should have exactly 5 resources');
   });
 
   it('each resource has a description and mimeType', async () => {
