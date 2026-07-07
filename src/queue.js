@@ -62,34 +62,65 @@ CREATE TABLE IF NOT EXISTS queue_meta (key TEXT PRIMARY KEY, value TEXT);  -- sc
 /**
  * Ensure the queue schema exists and is a supported version.
  * Sets WAL journaling and a busy_timeout for cross-process write contention.
+ *
+ * Per queue-design.md binding interpretation #1, the fresh-DB bootstrap
+ * runs the DDL and the version stamp in a SINGLE transaction so a killed
+ * process can never leave tables without a version row. The legacy corrupt
+ * state (objects present, version row missing — a pre-transactional
+ * bootstrap killed between DDL and stamp) is repaired by verifying the
+ * expected tables/indexes and stamping the version, never by re-running
+ * the DDL (its CREATE INDEX lines are not IF NOT EXISTS).
+ *
  * @param {import('node:sqlite').DatabaseSync} db
  */
 export function ensureSchema(db) {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA busy_timeout = 5000;');
 
-  const hasTable = db.prepare(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'recommendations'"
-  ).get();
+  const existing = new Set(db.prepare(
+    "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+  ).all().map(r => r.name));
 
-  if (!hasTable) {
-    // Fresh database: run the verbatim DDL and stamp the schema version.
-    db.exec(DDL);
-    db.prepare(
-      "INSERT OR REPLACE INTO queue_meta (key, value) VALUES ('schema_version', ?)"
-    ).run(String(SCHEMA_VERSION));
+  if (!existing.has('recommendations') && !existing.has('queue_meta')) {
+    // Fresh database: verbatim DDL + version stamp atomically.
+    db.exec('BEGIN');
+    try {
+      db.exec(DDL);
+      db.prepare(
+        "INSERT OR REPLACE INTO queue_meta (key, value) VALUES ('schema_version', ?)"
+      ).run(String(SCHEMA_VERSION));
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
     return;
   }
 
-  const row = db.prepare(
-    "SELECT value FROM queue_meta WHERE key = 'schema_version'"
-  ).get();
-  const version = row ? Number(row.value) : NaN;
-  if (version !== SCHEMA_VERSION) {
+  const row = existing.has('queue_meta')
+    ? db.prepare("SELECT value FROM queue_meta WHERE key = 'schema_version'").get()
+    : undefined;
+  if (row) {
+    if (Number(row.value) !== SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported queue schema version ${row.value} — this build expects ${SCHEMA_VERSION}`
+      );
+    }
+    return; // already provisioned
+  }
+
+  // Legacy corrupt state: verify the expected objects, then stamp.
+  const expected = ['recommendations', 'queue_meta', 'idx_rec_status', 'idx_rec_target'];
+  const missing = expected.filter(name => !existing.has(name));
+  if (missing.length > 0) {
     throw new Error(
-      `Unsupported queue schema version ${row ? row.value : '(missing)'} — this build expects ${SCHEMA_VERSION}`
+      `Corrupt queue schema: missing ${missing.join(', ')} and no schema_version — ` +
+      'repair or recreate queue.db'
     );
   }
+  db.prepare(
+    "INSERT OR REPLACE INTO queue_meta (key, value) VALUES ('schema_version', ?)"
+  ).run(String(SCHEMA_VERSION));
 }
 
 /**

@@ -89,6 +89,38 @@ describe('ensureSchema', () => {
     db.prepare("UPDATE queue_meta SET value = '99' WHERE key = 'schema_version'").run();
     assert.throws(() => ensureSchema(db), /schema version/i);
   });
+
+  it('repairs the legacy corrupt state (tables exist, no version row) by stamping', () => {
+    const db = new DatabaseSync(':memory:');
+    ensureSchema(db);
+    seed(db);
+    // Simulate a pre-transactional bootstrap killed between the DDL exec
+    // and the schema_version stamp: all objects exist, queue_meta is empty.
+    db.prepare("DELETE FROM queue_meta WHERE key = 'schema_version'").run();
+
+    ensureSchema(db); // must not re-run DDL (CREATE INDEX would fail) or throw
+
+    const row = db.prepare("SELECT value FROM queue_meta WHERE key = 'schema_version'").get();
+    assert.equal(Number(row.value), SCHEMA_VERSION);
+    const n = db.prepare('SELECT COUNT(*) AS n FROM recommendations').get().n;
+    assert.equal(n, 1, 'existing records survive the repair');
+  });
+
+  it('bootstrap is transactional: a mid-DDL failure leaves no partial schema', () => {
+    const db = new DatabaseSync(':memory:');
+    // Force the DDL's CREATE INDEX idx_rec_status to fail after the
+    // CREATE TABLE statements already succeeded.
+    db.exec('CREATE TABLE decoy (id TEXT)');
+    db.exec('CREATE INDEX idx_rec_status ON decoy(id)');
+
+    assert.throws(() => ensureSchema(db));
+
+    const table = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'recommendations'"
+    ).get();
+    assert.equal(table, undefined,
+      'the failed bootstrap must roll back — a half-provisioned schema bricks the queue');
+  });
 });
 
 // ─── canTransition ──────────────────────────────────────────────────────
