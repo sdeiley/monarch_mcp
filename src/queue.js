@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { resolveQueueDbPath } from './config.js';
+import { queryDb } from './db.js';
 import * as api from './api.js';
 
 export const SCHEMA_VERSION = 1;
@@ -371,6 +372,65 @@ function summarizePreflight(live) {
   };
 }
 
+/**
+ * Resolve category names → ids against the monarch.db mirror's categories
+ * (exact case-insensitive name match). AI/static-categorized diffs arrive
+ * from the extension with categoryId: null and only a categoryName — the
+ * id resolution that used to happen in the sidebar DOM now happens here,
+ * at apply time.
+ *
+ * @param {object} diff - payload.diff
+ * @returns {{diff: object, unresolved: string[], note?: string}}
+ *   A resolved copy of the diff plus any names with no mirror match.
+ */
+function resolveDiffCategories(diff) {
+  const needsResolution = [];
+  if (Array.isArray(diff.splits)) {
+    for (const s of diff.splits) {
+      if (s.categoryId == null && s.categoryName != null) needsResolution.push(s.categoryName);
+    }
+  }
+  if (diff.newCategoryId == null && diff.newCategoryName != null) {
+    needsResolution.push(diff.newCategoryName);
+  }
+  if (needsResolution.length === 0) return { diff, unresolved: [] };
+
+  let byName;
+  try {
+    const rows = queryDb(
+      `SELECT DISTINCT category_id, category_name FROM transactions
+       WHERE category_id IS NOT NULL AND category_name IS NOT NULL`
+    );
+    byName = new Map(rows.map(r => [String(r.category_name).trim().toLowerCase(), r.category_id]));
+  } catch (err) {
+    return {
+      diff,
+      unresolved: [...new Set(needsResolution)],
+      note: `mirror category lookup unavailable (${err.message})`,
+    };
+  }
+
+  const unresolved = new Set();
+  const lookup = (name) => {
+    const id = byName.get(String(name).trim().toLowerCase());
+    if (id == null) unresolved.add(name);
+    return id ?? null;
+  };
+
+  const resolved = { ...diff };
+  if (Array.isArray(diff.splits)) {
+    resolved.splits = diff.splits.map(s => (
+      s.categoryId == null && s.categoryName != null
+        ? { ...s, categoryId: lookup(s.categoryName) }
+        : s
+    ));
+  }
+  if (diff.newCategoryId == null && diff.newCategoryName != null) {
+    resolved.newCategoryId = lookup(diff.newCategoryName);
+  }
+  return { diff: resolved, unresolved: [...unresolved] };
+}
+
 /** Build the ordered mutation plan from a record's payload.diff. */
 function buildMutationPlan(record, live) {
   const diff = record.payload?.diff ?? {};
@@ -474,7 +534,24 @@ export async function applyRecord(db, token, { id, dryRun = false, now } = {}) {
     return { ok: false, refused, preflight, mutations: [], record };
   }
 
-  const mutations = buildMutationPlan(record, live);
+  // Resolve categoryName-only entries against the mirror before planning.
+  // An unresolvable name is a structured failure (retryable after fixing
+  // the record or refreshing the mirror), never a silent null category.
+  const { diff, unresolved, note } = resolveDiffCategories(record.payload?.diff ?? {});
+  if (unresolved.length > 0) {
+    const error =
+      `cannot resolve category name(s) ${unresolved.map(n => `'${n}'`).join(', ')} ` +
+      'against the local monarch.db mirror' + (note ? ` — ${note}` : '');
+    if (!dryRun) {
+      record = updateStatus(db, id, 'failed', 'agent', { error, now });
+    }
+    return { ok: false, error, preflight, mutations: [], record };
+  }
+
+  const mutations = buildMutationPlan(
+    { ...record, payload: { ...record.payload, diff } },
+    live
+  );
   if (mutations.length === 1) {
     // Only the tag mutation — the diff carries no applicable change.
     throw new Error(

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
-import { makeQueueDb, seed, seedExtensionSplitRecord } from './helpers/queue-seed.js';
+import { makeQueueDb, seed, extensionSplitRecord, seedExtensionSplitRecord } from './helpers/queue-seed.js';
 import { getRecord } from '../src/queue.js';
 
 // Point to fixture DB (mirror) and inject a fake token so loadToken()
@@ -410,6 +410,94 @@ describe('queue_apply tool', () => {
         ['split_transaction', 'set_transaction_tags'],
         'diff.newName/newCategoryId scaffolded as null must not produce an update_transaction mutation'
       );
+    } finally {
+      await close();
+    }
+  });
+
+  // AI/static-categorized splits arrive with categoryId: null and only a
+  // categoryName (id resolution used to happen in the sidebar DOM). The
+  // apply path must resolve names against the monarch.db mirror's
+  // categories (exact case-insensitive match; fixture mirror has
+  // cat-001 Groceries and cat-002 Subscriptions).
+  it('resolves null split categoryIds from categoryName via the mirror (dry_run shows the ids)', async () => {
+    const db = makeQueueDb();
+    const rec = extensionSplitRecord();
+    rec.payload.diff.splits[0].categoryId = null;
+    rec.payload.diff.splits[0].categoryName = 'Subscriptions';
+    rec.payload.diff.splits[1].categoryId = null;
+    rec.payload.diff.splits[1].categoryName = 'groceries'; // case-insensitive
+    seed(db, rec);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(calls, { getTransaction: LIVE_CLEAN });
+
+      const result = await client.callTool({
+        name: 'queue_apply',
+        arguments: { id: rec.id, dry_run: true },
+      });
+
+      assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+      const data = parseResult(result);
+      assert.equal(data.ok, true);
+      const split = data.mutations.find(m => m.op === 'split_transaction');
+      assert.deepEqual(
+        split.input.splitData.map(s => s.categoryId),
+        ['cat-002', 'cat-001'],
+        'dry_run must show the mirror-resolved category ids'
+      );
+    } finally {
+      await close();
+    }
+  });
+
+  it('resolves a null newCategoryId from newCategoryName on update records', async () => {
+    const db = makeQueueDb();
+    seed(db, {
+      id: 'r-upd', type: 'update', status: 'pending', target_txn_id: 'txn-1',
+      payload: {
+        source: {}, target: {},
+        diff: { newName: 'Apple One', newCategoryId: null, newCategoryName: 'Subscriptions', addNotes: null },
+      },
+    });
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(calls, { getTransaction: LIVE_CLEAN });
+
+      const result = await client.callTool({
+        name: 'queue_apply',
+        arguments: { id: 'r-upd', dry_run: true },
+      });
+
+      assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+      const data = parseResult(result);
+      const update = data.mutations.find(m => m.op === 'update_transaction');
+      assert.equal(update.input.category, 'cat-002');
+    } finally {
+      await close();
+    }
+  });
+
+  it('fails the record with a clear error when a categoryName cannot be resolved', async () => {
+    const db = makeQueueDb();
+    const rec = extensionSplitRecord();
+    rec.payload.diff.splits[0].categoryId = null;
+    rec.payload.diff.splits[0].categoryName = 'Imaginary Category';
+    seed(db, rec);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(calls, { getTransaction: LIVE_CLEAN });
+
+      const result = await client.callTool({ name: 'queue_apply', arguments: { id: rec.id } });
+
+      assert.ok(!result.isError, 'refusal is a structured result, not a protocol error');
+      const data = parseResult(result);
+      assert.equal(data.ok, false);
+      assert.match(data.error, /Imaginary Category/);
+      assert.equal(calls.length, 1, 'no mutation may run past the preflight fetch');
+      const after = getRecord(db, rec.id);
+      assert.equal(after.status, 'failed');
+      assert.match(after.error, /Imaginary Category/);
     } finally {
       await close();
     }
