@@ -5,7 +5,7 @@ import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
-import { makeQueueDb, seed } from './helpers/queue-seed.js';
+import { makeQueueDb, seed, seedExtensionSplitRecord } from './helpers/queue-seed.js';
 import { getRecord } from '../src/queue.js';
 
 // Point to fixture DB (mirror) and inject a fake token so loadToken()
@@ -385,6 +385,31 @@ describe('queue_apply tool', () => {
       assert.equal(rec.applied_by, 'agent');
       assert.ok(rec.applied_at, 'applied_at should be set');
       assert.equal(rec.revision, 2);
+    } finally {
+      await close();
+    }
+  });
+
+  it('a split record in the extension toQueueRecord shape yields a split-only plan (null diff scaffolding is not an update)', async () => {
+    const db = makeQueueDb();
+    seedExtensionSplitRecord(db, { id: 'r-ext' });
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(calls, { getTransaction: LIVE_CLEAN });
+
+      const result = await client.callTool({
+        name: 'queue_apply',
+        arguments: { id: 'r-ext', dry_run: true },
+      });
+
+      assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+      const data = parseResult(result);
+      assert.equal(data.ok, true);
+      assert.deepEqual(
+        data.mutations.map(m => m.op),
+        ['split_transaction', 'set_transaction_tags'],
+        'diff.newName/newCategoryId scaffolded as null must not produce an update_transaction mutation'
+      );
     } finally {
       await close();
     }

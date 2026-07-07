@@ -390,9 +390,12 @@ function buildMutationPlan(record, live) {
     plan.push({ op: 'split_transaction', input: { transactionId: txnId, splitData } });
   }
 
+  // != null (not !== undefined): the extension's toQueueRecord scaffolds
+  // newName/newCategoryId as null on split records — null carries no intent
+  // and must never become updateTransaction({ name: null, category: null }).
   const update = {};
-  if (diff.newName !== undefined) update.name = diff.newName;
-  if (diff.newCategoryId !== undefined) update.category = diff.newCategoryId;
+  if (diff.newName != null) update.name = diff.newName;
+  if (diff.newCategoryId != null) update.category = diff.newCategoryId;
   if (diff.addNotes) {
     update.notes = live.notes ? `${live.notes}\n${diff.addNotes}` : diff.addNotes;
   }
