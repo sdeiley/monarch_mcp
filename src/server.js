@@ -313,6 +313,27 @@ function registerQueueTools(server, getQueueDb) {
       return record;
     })
   );
+
+  server.registerTool(
+    'queue_update_status',
+    {
+      description: 'Transition a recommendation-queue record to a new lifecycle status as the ' +
+        "agent actor: dismiss a proposal ('dismissed') or reset a failed one for retry " +
+        "('pending'). Transitions the agent is not allowed to make (e.g. resurrecting an " +
+        'applied/dismissed record, or extension-only statuses) return an error. ' +
+        'To actually execute a recommendation, use queue_apply instead.',
+      inputSchema: z.object({
+        id: z.string().describe('Recommendation id (from queue_list)'),
+        status: z.enum(QUEUE_STATUSES).describe('Target status'),
+        note: z.string().optional()
+          .describe("Optional annotation recorded on the record (e.g. why it was dismissed)"),
+      }),
+    },
+    queueHandler(({ id, status, note }) => {
+      const record = updateStatus(getQueueDb(), id, status, 'agent', { error: note });
+      return { ok: true, record };
+    })
+  );
 }
 
 // ─── Write tools (live Monarch API mutations) ───────────────────────────

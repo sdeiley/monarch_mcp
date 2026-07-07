@@ -165,6 +165,105 @@ describe('queue_get tool', () => {
   });
 });
 
+// ─── queue_update_status ────────────────────────────────────────────────
+
+describe('queue_update_status tool', () => {
+  it('is registered', async () => {
+    const { client, close } = await createTestPair(makeQueueDb());
+    try {
+      const { tools } = await client.listTools();
+      assert.ok(tools.some(t => t.name === 'queue_update_status'));
+    } finally {
+      await close();
+    }
+  });
+
+  it('performs a valid agent transition and returns the updated record', async () => {
+    const db = makeQueueDb();
+    seed(db, { id: 'r1', status: 'pending' });
+    const { client, close } = await createTestPair(db);
+    try {
+      const result = await client.callTool({
+        name: 'queue_update_status',
+        arguments: { id: 'r1', status: 'dismissed', note: 'user said skip it' },
+      });
+      assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+      const data = parseResult(result);
+      assert.equal(data.ok, true);
+      assert.equal(data.record.status, 'dismissed');
+      assert.equal(data.record.revision, 2);
+      assert.equal(data.record.error, 'user said skip it');
+    } finally {
+      await close();
+    }
+  });
+
+  it('allows retrying a failed record back to pending', async () => {
+    const db = makeQueueDb();
+    seed(db, { id: 'r1', status: 'failed', error: 'boom' });
+    const { client, close } = await createTestPair(db);
+    try {
+      const result = await client.callTool({
+        name: 'queue_update_status',
+        arguments: { id: 'r1', status: 'pending' },
+      });
+      assert.ok(!result.isError);
+      assert.equal(parseResult(result).record.status, 'pending');
+    } finally {
+      await close();
+    }
+  });
+
+  it('rejects extension-only transitions (actor is fixed to agent)', async () => {
+    const db = makeQueueDb();
+    seed(db, { id: 'r1', status: 'pending' });
+    const { client, close } = await createTestPair(db);
+    try {
+      for (const status of ['approved', 'saved-for-agent', 'stale']) {
+        const result = await client.callTool({
+          name: 'queue_update_status',
+          arguments: { id: 'r1', status },
+        });
+        assert.ok(result.isError, `agent should not be able to set '${status}'`);
+        assert.match(result.content[0].text, /transition/i);
+      }
+      assert.equal(getRecord(db, 'r1').status, 'pending', 'record untouched');
+    } finally {
+      await close();
+    }
+  });
+
+  it('never resurrects an applied record', async () => {
+    const db = makeQueueDb();
+    seed(db, { id: 'r1', status: 'applied' });
+    const { client, close } = await createTestPair(db);
+    try {
+      const result = await client.callTool({
+        name: 'queue_update_status',
+        arguments: { id: 'r1', status: 'pending' },
+      });
+      assert.ok(result.isError, 'should be an error');
+      assert.equal(getRecord(db, 'r1').status, 'applied');
+    } finally {
+      await close();
+    }
+  });
+
+  it('errors on unknown ids', async () => {
+    const { client, close } = await createTestPair(makeQueueDb());
+    try {
+      const result = await client.callTool({
+        name: 'queue_update_status',
+        arguments: { id: 'nope', status: 'dismissed' },
+      });
+      assert.ok(result.isError);
+      assert.match(result.content[0].text, /not found/i);
+    } finally {
+      await close();
+    }
+  });
+});
+
 // ─── monarch://queue/stats resource ─────────────────────────────────────
 
 describe('queue/stats resource', () => {
