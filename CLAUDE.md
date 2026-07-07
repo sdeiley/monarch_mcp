@@ -65,7 +65,7 @@ Read:
 
 Write (mutate the LIVE Monarch account; agents must confirm with the user first; local mirror is stale until `refresh_transactions`):
 
-- `update_transaction(id, ...)` — category, merchant name, notes, hideFromReports, needsReview
+- `update_transaction(id, ...)` — category, merchant name, notes, date (YYYY-MM-DD), hideFromReports, needsReview
 - `split_transaction(transactionId, splits)` — replace splits; amounts must sum exactly to parent; `[]` clears
 - `create_tag(name, color?)` — returns created tag with ID
 - `set_transaction_tags(transactionId, tagIds)` — replaces the full tag set

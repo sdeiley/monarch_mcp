@@ -107,6 +107,22 @@ describe('Monarch API write client', () => {
       assert.equal(txn.notes, 'hello');
     });
 
+    it('carries date through to the GraphQL input', async () => {
+      mockFetch({
+        updateTransaction: {
+          transaction: { id: 't1', date: '2026-03-14' },
+          errors: null,
+        },
+      });
+
+      const input = { id: 't1', date: '2026-03-14' };
+      const txn = await api.updateTransaction(FAKE_TOKEN, input);
+
+      const { body } = lastCall();
+      assert.deepEqual(body.variables, { input: { id: 't1', date: '2026-03-14' } });
+      assert.equal(txn.date, '2026-03-14');
+    });
+
     it('throws when the payload contains API-level errors', async () => {
       mockFetch({
         updateTransaction: {

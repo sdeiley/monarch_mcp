@@ -405,7 +405,7 @@ function registerWriteTools(server) {
   server.registerTool(
     'update_transaction',
     {
-      description: 'Update a Monarch transaction: set category, merchant name, notes, ' +
+      description: 'Update a Monarch transaction: set category, merchant name, notes, date, ' +
         'hide-from-reports, or needs-review. Returns the updated transaction.' +
         WRITE_WARNING,
       inputSchema: z.object({
@@ -415,21 +415,26 @@ function registerWriteTools(server) {
         merchantName: z.string().optional()
           .describe('New merchant/display name for the transaction'),
         notes: z.string().optional().describe('Notes text (replaces existing notes)'),
+        date: z.string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be in YYYY-MM-DD format')
+          .optional()
+          .describe('Move the transaction to this date (used e.g. to re-date return credits to the original purchase date)'),
         hideFromReports: z.boolean().optional().describe('Hide transaction from reports'),
         needsReview: z.boolean().optional().describe('Mark as needing review'),
       }),
     },
-    writeHandler(async (token, { id, categoryId, merchantName, notes, hideFromReports, needsReview }) => {
+    writeHandler(async (token, { id, categoryId, merchantName, notes, date, hideFromReports, needsReview }) => {
       const input = { id };
       if (categoryId !== undefined) input.category = categoryId;
       if (merchantName !== undefined) input.name = merchantName;
       if (notes !== undefined) input.notes = notes;
+      if (date !== undefined) input.date = date;
       if (hideFromReports !== undefined) input.hideFromReports = hideFromReports;
       if (needsReview !== undefined) input.needsReview = needsReview;
 
       if (Object.keys(input).length === 1) {
         throw new Error(
-          'No update fields provided. Supply at least one of: categoryId, merchantName, notes, hideFromReports, needsReview.'
+          'No update fields provided. Supply at least one of: categoryId, merchantName, notes, date, hideFromReports, needsReview.'
         );
       }
 

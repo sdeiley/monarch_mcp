@@ -108,6 +108,45 @@ describe('update_transaction tool', () => {
     assert.equal(txn.merchant.name, 'Renamed Merchant');
   });
 
+  it('sends date through to the mutation input when provided', async () => {
+    installMockFetch(calls, {
+      updateTransaction: {
+        transaction: { id: 'txn-3', date: '2026-03-14' },
+        errors: null,
+      },
+    });
+
+    const result = await client.callTool({
+      name: 'update_transaction',
+      arguments: { id: 'txn-3', date: '2026-03-14' },
+    });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    assert.deepEqual(calls[0].body.variables, {
+      input: { id: 'txn-3', date: '2026-03-14' },
+    });
+  });
+
+  it('rejects a malformed date at the tool layer without calling the API', async () => {
+    installMockFetch(calls, {});
+
+    let errorText;
+    try {
+      const result = await client.callTool({
+        name: 'update_transaction',
+        arguments: { id: 'txn-3', date: '03/14/2026' },
+      });
+      assert.ok(result.isError, 'should be an error');
+      errorText = result.content[0].text;
+    } catch (err) {
+      // SDK may surface schema validation as a protocol-level error
+      errorText = err.message;
+    }
+
+    assert.match(errorText, /YYYY-MM-DD/, 'error should explain the expected format');
+    assert.equal(calls.length, 0, 'must not hit the API');
+  });
+
   it('sends hideFromReports when provided', async () => {
     installMockFetch(calls, {
       updateTransaction: { transaction: { id: 'txn-2', hideFromReports: true }, errors: null },

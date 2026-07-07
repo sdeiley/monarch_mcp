@@ -102,7 +102,7 @@ The server exposes 5 read-only resources:
 |------|-------------|
 | `query_transactions` | Execute read-only SQL (SELECT/WITH) against the transactions table |
 | `refresh_transactions` | Refresh local DB from Monarch API (`recent` = 3 months, `full` = all history) |
-| `update_transaction` | Set category, merchant name, notes, hide-from-reports, needs-review on a transaction (write) |
+| `update_transaction` | Set category, merchant name, notes, date, hide-from-reports, needs-review on a transaction (write) |
 | `split_transaction` | Replace a transaction's splits; amounts must sum exactly to the parent; empty array clears splits (write) |
 | `create_tag` | Create a new transaction tag, returns the tag with its ID (write) |
 | `set_transaction_tags` | Replace the full tag set on a transaction (write) |
