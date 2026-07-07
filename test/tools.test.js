@@ -27,13 +27,12 @@ describe('MCP Tools registration', () => {
   before(async () => { ({ client, close } = await createTestPair()); });
   after(async () => { await close(); });
 
-  it('lists both expected tools', async () => {
+  it('lists the read tools', async () => {
     const result = await client.listTools();
     const names = result.tools.map(t => t.name);
 
     assert.ok(names.includes('query_transactions'), 'should have query_transactions');
     assert.ok(names.includes('refresh_transactions'), 'should have refresh_transactions');
-    assert.equal(result.tools.length, 2, 'should have exactly 2 tools');
   });
 
   it('each tool has a description and inputSchema', async () => {

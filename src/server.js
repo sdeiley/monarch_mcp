@@ -10,9 +10,39 @@ import { z } from 'zod';
 import { queryDb, getSchema } from './db.js';
 import { loadToken } from './token.js';
 import { refreshDb } from './refresh.js';
+import * as api from './api.js';
 
 export const SERVER_NAME = 'monarch-money';
-export const SERVER_VERSION = '0.2.0';
+export const SERVER_VERSION = '0.3.0';
+
+/**
+ * Standard suffix for write tool descriptions.
+ */
+const WRITE_WARNING =
+  ' WRITES TO THE LIVE MONARCH ACCOUNT — confirm with the user before calling. ' +
+  'The local SQLite mirror becomes stale for affected transactions until refresh_transactions is run.';
+
+/**
+ * Wrap a write tool handler: loads the token, runs the mutation, and
+ * formats success/error as MCP tool results. Never includes the token
+ * in error output.
+ */
+function writeHandler(fn) {
+  return async (args) => {
+    try {
+      const token = loadToken();
+      const result = await fn(token, args);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result) }],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: err.message }],
+      };
+    }
+  };
+}
 
 /**
  * Create and configure the MCP server instance.
@@ -180,5 +210,47 @@ function registerTools(server) {
         };
       }
     }
+  );
+
+  registerWriteTools(server);
+}
+
+// ─── Write tools (live Monarch API mutations) ───────────────────────────
+
+function registerWriteTools(server) {
+
+  server.registerTool(
+    'update_transaction',
+    {
+      description: 'Update a Monarch transaction: set category, merchant name, notes, ' +
+        'hide-from-reports, or needs-review. Returns the updated transaction.' +
+        WRITE_WARNING,
+      inputSchema: z.object({
+        id: z.string().describe('Monarch transaction ID (UUID)'),
+        categoryId: z.string().optional()
+          .describe('Category ID to assign (see monarch://categories)'),
+        merchantName: z.string().optional()
+          .describe('New merchant/display name for the transaction'),
+        notes: z.string().optional().describe('Notes text (replaces existing notes)'),
+        hideFromReports: z.boolean().optional().describe('Hide transaction from reports'),
+        needsReview: z.boolean().optional().describe('Mark as needing review'),
+      }),
+    },
+    writeHandler(async (token, { id, categoryId, merchantName, notes, hideFromReports, needsReview }) => {
+      const input = { id };
+      if (categoryId !== undefined) input.category = categoryId;
+      if (merchantName !== undefined) input.name = merchantName;
+      if (notes !== undefined) input.notes = notes;
+      if (hideFromReports !== undefined) input.hideFromReports = hideFromReports;
+      if (needsReview !== undefined) input.needsReview = needsReview;
+
+      if (Object.keys(input).length === 1) {
+        throw new Error(
+          'No update fields provided. Supply at least one of: categoryId, merchantName, notes, hideFromReports, needsReview.'
+        );
+      }
+
+      return api.updateTransaction(token, input);
+    })
   );
 }
