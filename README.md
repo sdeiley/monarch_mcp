@@ -13,8 +13,9 @@ Most Monarch Money MCP servers are **API passthroughs** — each tool call hits 
 - **MCP Resources** — the only Monarch MCP that exposes schema, accounts, categories, and tags as MCP resources. This gives AI clients the metadata they need to write good queries without burning tool calls.
 - **Token-efficient** — pre-computed resources and SQL-level filtering mean only relevant data crosses the wire. Other servers return full API payloads on every call.
 - **Zero native dependencies** — uses Node.js built-in `node:sqlite`, no compiled extensions. Just `npm install` and go.
-- **102 tests** — fixture-based test suite with no dependency on real financial data; write tools are tested against a mocked API.
+- **212 tests** — fixture-based test suite with no dependency on real financial data; write tools are tested against a mocked API.
 - **Write tools** — update, split, and tag transactions, and manage auto-categorization rules, directly against the live Monarch API. Designed for the "extension/mirror as read-only sensor, agent as sole writer" architecture.
+- **Recommendation queue** — review and apply extension-generated transaction proposals (splits, renames, categorizations) from a shared local `queue.db`, with a guarded status lifecycle and double-apply protection.
 
 **Trade-off:** This server focuses on transactions (SQL analysis + write operations). For budgets, investments, or cashflow, pair it with an API-passthrough MCP like [robcerda/monarch-mcp-server](https://github.com/robcerda/monarch-mcp-server).
 
@@ -85,7 +86,7 @@ Or if installed globally:
 
 ## Resources
 
-The server exposes 4 read-only resources:
+The server exposes 5 read-only resources:
 
 | Resource | Description |
 |----------|-------------|
@@ -93,6 +94,7 @@ The server exposes 4 read-only resources:
 | `monarch://accounts` | All accounts with transaction counts |
 | `monarch://categories` | All categories with group/type |
 | `monarch://tags` | Deduplicated, sorted tag list |
+| `monarch://queue/stats` | Recommendation queue counts by status/type/merchant |
 
 ## Tools
 
@@ -108,6 +110,11 @@ The server exposes 4 read-only resources:
 | `create_rule` | Create an auto-categorization rule (criteria + actions) (write) |
 | `update_rule` | Update an existing rule by ID (write) |
 | `delete_rule` | Delete a rule by ID (write) |
+| `queue_list` | List recommendation-queue records with status/type/merchant/confidence filters |
+| `queue_get` | Fetch one queue record with its full payload (diff, reasoning) |
+| `queue_update_status` | Transition a queue record (agent actor): dismiss, or reset failed → pending |
+| `queue_apply` | Preflight and execute a queued recommendation against the live account; supports `dry_run` (write) |
+| `queue_sweep` | Mark stale records against the local mirror and purge old terminal records (local only) |
 
 ### Write tools
 
@@ -120,6 +127,20 @@ Notes:
 - `split_transaction` validates that split amounts sum exactly to the live parent transaction amount (to the cent) before calling the API. Amounts are negative for expenses.
 - `set_transaction_tags` replaces the complete tag set; include existing tag IDs you want to keep.
 - Rule create/update mutations return no rule entity (Monarch API limitation); use `list_rules` to confirm.
+
+### Recommendation Queue
+
+The `queue_*` tools operate on `queue.db` in the data directory — a local recommendation queue shared with the [Monarch Chrome extension](https://github.com/sdeiley/monarch_chrome_extension), whose parsing pipeline is the producer: it captures proposed transaction changes (invoice-based splits, merchant renames, categorizations) as queue records with a payload diff, confidence, and reasoning.
+
+The agent-side review workflow:
+
+1. `queue_list` with `status: "pending"` — present items to the user grouped by `group_key`, with confidence and reasoning.
+2. After the user approves, `queue_apply` each approved id (`dry_run: true` first to preview the mutation plan).
+3. `queue_sweep` occasionally to mark stale records and purge old terminal ones.
+
+`queue_apply` is safer than the raw write tools for queued items: it re-fetches the live transaction and refuses (marking the record `stale`) if the transaction already carries the `"Ext Processed"` tag or has splits, validates split sums against the live amount, sets `"Ext Processed"` on success, and records the outcome (`applied` / `failed`) with a guarded status transition so double-apply is impossible — even if the extension raced it. Status lifecycle: `pending → applied|dismissed|stale`, `failed → pending` for retry; `applied`/`dismissed` are terminal.
+
+The queue database is created lazily; if the extension side isn't installed the queue tools simply report an empty queue.
 
 ### Transaction Table Columns
 
@@ -161,7 +182,7 @@ monarch-mcp --help    # Show help
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MONARCH_TOKEN` | Auth token (required for refresh and all write tools) | — |
-| `MONARCH_DATA_DIR` | Data directory path | `~/.monarch` |
+| `MONARCH_DATA_DIR` | Data directory path (holds `monarch.db` and `queue.db`) | `~/.monarch` |
 
 ## Development
 

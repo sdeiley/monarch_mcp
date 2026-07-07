@@ -17,7 +17,7 @@ import {
 } from './queue.js';
 
 export const SERVER_NAME = 'monarch-money';
-export const SERVER_VERSION = '0.3.0';
+export const SERVER_VERSION = '0.4.0';
 
 /**
  * Standard suffix for write tool descriptions.
@@ -76,6 +76,14 @@ export function createServer(options = {}) {
         'for the affected transactions until refresh_transactions is run. ' +
         'Transaction/category/tag IDs come from the local mirror (query_transactions and ' +
         'monarch:// resources); rule IDs come from list_rules.\n\n' +
+        'RECOMMENDATION QUEUE (queue_list, queue_get, queue_update_status, queue_apply, ' +
+        'queue_sweep; resource monarch://queue/stats): the browser extension pipeline captures ' +
+        'proposed transaction changes (splits, renames, categorizations) into a local queue.db. ' +
+        'Review workflow: queue_list with status=pending → present items to the user grouped by ' +
+        'group_key with confidence and reasoning → after the user approves, queue_apply each ' +
+        'approved id (dry_run=true first to preview) → queue_sweep for housekeeping. For queued ' +
+        'items always use queue_apply instead of the raw write tools — it preflights the live ' +
+        'transaction, sets the "Ext Processed" tag, and keeps queue status consistent.\n\n' +
         'The transactions table has columns: id, amount, date, merchant_name, plaid_name, ' +
         'category_name, category_group, category_type, account_name, notes, tags, ' +
         'is_split, parent_id, pending, is_recurring. ' +
