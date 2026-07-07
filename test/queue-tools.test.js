@@ -264,6 +264,373 @@ describe('queue_update_status tool', () => {
   });
 });
 
+// ─── queue_apply ────────────────────────────────────────────────────────
+
+describe('queue_apply tool', () => {
+  let calls, originalFetch;
+  beforeEach(() => { calls = []; originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  const LIVE_CLEAN = {
+    id: 'txn-1', amount: -15.5, date: '2026-07-01', notes: null,
+    hasSplitTransactions: false,
+    tags: [{ id: 'tag-a', name: 'Apple', color: '#f00', order: 1 }],
+  };
+
+  const SPLIT_DIFF = {
+    splits: [
+      { amount: -10.00, categoryId: 'c1', merchantName: 'Item A', notes: 'first', categorySource: 'ai' },
+      { amount: -5.50, categoryId: 'c2', merchantName: 'Item B' },
+    ],
+  };
+
+  function seedSplitRec(db, overrides = {}) {
+    return seed(db, {
+      id: 'r1', type: 'split', status: 'pending', target_txn_id: 'txn-1',
+      payload: { source: {}, target: { categoryId: 'c0' }, diff: SPLIT_DIFF },
+      ...overrides,
+    });
+  }
+
+  it('is registered', async () => {
+    const { client, close } = await createTestPair(makeQueueDb());
+    try {
+      const { tools } = await client.listTools();
+      assert.ok(tools.some(t => t.name === 'queue_apply'));
+    } finally {
+      await close();
+    }
+  });
+
+  it('dry_run returns the preflight and mutation plan without writing anything', async () => {
+    const db = makeQueueDb();
+    seedSplitRec(db);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(calls, { getTransaction: LIVE_CLEAN });
+
+      const result = await client.callTool({
+        name: 'queue_apply',
+        arguments: { id: 'r1', dry_run: true },
+      });
+
+      assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+      const data = parseResult(result);
+      assert.equal(data.ok, true);
+      assert.equal(data.dryRun, true);
+      assert.equal(data.preflight.transactionFound, true);
+      assert.equal(data.preflight.extProcessed, false);
+      assert.deepEqual(data.mutations.map(m => m.op), ['split_transaction', 'set_transaction_tags']);
+      assert.equal(calls.length, 1, 'only the preflight fetch runs');
+      assert.match(calls[0].body.query, /GetTransactionDrawer/);
+      assert.equal(getRecord(db, 'r1').status, 'pending', 'no status change on dry run');
+      assert.equal(getRecord(db, 'r1').revision, 1);
+    } finally {
+      await close();
+    }
+  });
+
+  it('applies a split record: mutation, Ext Processed tag, then marks applied by agent', async () => {
+    const db = makeQueueDb();
+    seedSplitRec(db);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(
+        calls,
+        { getTransaction: LIVE_CLEAN },
+        {
+          updateTransactionSplit: {
+            transaction: { id: 'txn-1', amount: -15.5, hasSplitTransactions: true, splitTransactions: [] },
+            errors: null,
+          },
+        },
+        { householdTransactionTags: [
+          { id: 'tag-a', name: 'Apple', color: '#f00', order: 1 },
+          { id: 'tag-ext', name: 'Ext Processed', color: '#0f0', order: 2 },
+        ] },
+        {
+          setTransactionTags: {
+            transaction: { id: 'txn-1', tags: [] },
+            errors: null,
+          },
+        }
+      );
+
+      const result = await client.callTool({ name: 'queue_apply', arguments: { id: 'r1' } });
+
+      assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+      const data = parseResult(result);
+      assert.equal(data.ok, true);
+      assert.equal(calls.length, 4);
+
+      // Split mutation strips extension-side split metadata (categorySource, ...)
+      assert.match(calls[1].body.query, /Common_SplitTransactionMutation/);
+      assert.deepEqual(calls[1].body.variables.input, {
+        transactionId: 'txn-1',
+        splitData: [
+          { amount: -10.00, categoryId: 'c1', merchantName: 'Item A', notes: 'first' },
+          { amount: -5.50, categoryId: 'c2', merchantName: 'Item B' },
+        ],
+      });
+
+      // Ext Processed is added while existing tags are preserved
+      assert.match(calls[3].body.query, /Web_SetTransactionTags/);
+      assert.deepEqual(calls[3].body.variables.input, {
+        transactionId: 'txn-1',
+        tagIds: ['tag-a', 'tag-ext'],
+      });
+
+      const rec = getRecord(db, 'r1');
+      assert.equal(rec.status, 'applied');
+      assert.equal(rec.applied_by, 'agent');
+      assert.ok(rec.applied_at, 'applied_at should be set');
+      assert.equal(rec.revision, 2);
+    } finally {
+      await close();
+    }
+  });
+
+  it('creates the Ext Processed tag when it does not exist yet', async () => {
+    const db = makeQueueDb();
+    seedSplitRec(db);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(
+        calls,
+        { getTransaction: LIVE_CLEAN },
+        { updateTransactionSplit: { transaction: { id: 'txn-1', hasSplitTransactions: true, splitTransactions: [] }, errors: null } },
+        { householdTransactionTags: [{ id: 'tag-a', name: 'Apple', color: '#f00', order: 1 }] },
+        { createTransactionTag: { __typename: 'CreateTransactionTagPayload' } },
+        { householdTransactionTags: [
+          { id: 'tag-a', name: 'Apple', color: '#f00', order: 1 },
+          { id: 'tag-ext', name: 'Ext Processed', color: null, order: 2 },
+        ] },
+        { setTransactionTags: { transaction: { id: 'txn-1', tags: [] }, errors: null } }
+      );
+
+      const result = await client.callTool({ name: 'queue_apply', arguments: { id: 'r1' } });
+
+      assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+      assert.equal(calls.length, 6);
+      assert.match(calls[3].body.query, /Common_CreateTransactionTag/);
+      assert.equal(calls[3].body.variables.input.name, 'Ext Processed');
+      assert.deepEqual(calls[5].body.variables.input.tagIds, ['tag-a', 'tag-ext']);
+      assert.equal(getRecord(db, 'r1').status, 'applied');
+    } finally {
+      await close();
+    }
+  });
+
+  it('refuses and marks stale when the live target already carries Ext Processed', async () => {
+    const db = makeQueueDb();
+    seedSplitRec(db);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(calls, {
+        getTransaction: {
+          ...LIVE_CLEAN,
+          tags: [{ id: 'tag-ext', name: 'Ext Processed', color: null, order: 1 }],
+        },
+      });
+
+      const result = await client.callTool({ name: 'queue_apply', arguments: { id: 'r1' } });
+
+      assert.ok(!result.isError, 'refusal is a structured result, not a protocol error');
+      const data = parseResult(result);
+      assert.equal(data.ok, false);
+      assert.match(data.refused, /already processed/i);
+      assert.equal(calls.length, 1, 'no mutations may run');
+      const rec = getRecord(db, 'r1');
+      assert.equal(rec.status, 'stale');
+      assert.match(rec.error, /already processed/i);
+    } finally {
+      await close();
+    }
+  });
+
+  it('refuses and marks stale when the live target already has splits', async () => {
+    const db = makeQueueDb();
+    seedSplitRec(db);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(calls, { getTransaction: { ...LIVE_CLEAN, hasSplitTransactions: true } });
+
+      const result = await client.callTool({ name: 'queue_apply', arguments: { id: 'r1' } });
+
+      const data = parseResult(result);
+      assert.equal(data.ok, false);
+      assert.equal(calls.length, 1);
+      assert.equal(getRecord(db, 'r1').status, 'stale');
+    } finally {
+      await close();
+    }
+  });
+
+  it('marks stale when the target transaction no longer exists', async () => {
+    const db = makeQueueDb();
+    seedSplitRec(db);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(calls, { getTransaction: null });
+
+      const result = await client.callTool({ name: 'queue_apply', arguments: { id: 'r1' } });
+
+      const data = parseResult(result);
+      assert.equal(data.ok, false);
+      assert.equal(data.preflight.transactionFound, false);
+      assert.equal(getRecord(db, 'r1').status, 'stale');
+    } finally {
+      await close();
+    }
+  });
+
+  it('applies an update-type record via updateTransaction, appending notes', async () => {
+    const db = makeQueueDb();
+    seed(db, {
+      id: 'r2', type: 'update', status: 'saved-for-agent', target_txn_id: 'txn-1',
+      payload: {
+        source: {}, target: {},
+        diff: { newName: 'Apple One', newCategoryId: 'c9', addNotes: 'Subscription bundle' },
+      },
+    });
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(
+        calls,
+        { getTransaction: { ...LIVE_CLEAN, notes: 'existing note' } },
+        { updateTransaction: { transaction: { id: 'txn-1' }, errors: null } },
+        { householdTransactionTags: [{ id: 'tag-ext', name: 'Ext Processed', color: null, order: 1 }] },
+        { setTransactionTags: { transaction: { id: 'txn-1', tags: [] }, errors: null } }
+      );
+
+      const result = await client.callTool({ name: 'queue_apply', arguments: { id: 'r2' } });
+
+      assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+      assert.match(calls[1].body.query, /Web_TransactionDrawerUpdateTransaction/);
+      assert.deepEqual(calls[1].body.variables.input, {
+        id: 'txn-1',
+        name: 'Apple One',
+        category: 'c9',
+        notes: 'existing note\nSubscription bundle',
+      });
+      const rec = getRecord(db, 'r2');
+      assert.equal(rec.status, 'applied');
+      assert.equal(rec.applied_by, 'agent');
+    } finally {
+      await close();
+    }
+  });
+
+  it('marks the record failed with the error message when a mutation fails', async () => {
+    const db = makeQueueDb();
+    seedSplitRec(db);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(
+        calls,
+        { getTransaction: LIVE_CLEAN },
+        {
+          updateTransactionSplit: {
+            transaction: null,
+            errors: [{ message: 'Split failed upstream', code: 'error', fieldErrors: null }],
+          },
+        }
+      );
+
+      const result = await client.callTool({ name: 'queue_apply', arguments: { id: 'r1' } });
+
+      const data = parseResult(result);
+      assert.equal(data.ok, false);
+      assert.match(data.error, /Split failed upstream/);
+      const rec = getRecord(db, 'r1');
+      assert.equal(rec.status, 'failed');
+      assert.match(rec.error, /Split failed upstream/);
+    } finally {
+      await close();
+    }
+  });
+
+  it('rejects split diffs whose amounts do not sum to the live amount, marking failed', async () => {
+    const db = makeQueueDb();
+    seedSplitRec(db);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(calls, { getTransaction: { ...LIVE_CLEAN, amount: -20.00 } });
+
+      const result = await client.callTool({ name: 'queue_apply', arguments: { id: 'r1' } });
+
+      const data = parseResult(result);
+      assert.equal(data.ok, false);
+      assert.match(data.error, /-15\.50/);
+      assert.match(data.error, /-20\.00/);
+      assert.equal(calls.length, 1, 'no mutation may run');
+      assert.equal(getRecord(db, 'r1').status, 'failed');
+    } finally {
+      await close();
+    }
+  });
+
+  it('refuses to apply from statuses the agent may not apply from', async () => {
+    const db = makeQueueDb();
+    seed(db, { id: 'r-applied', status: 'applied' });
+    seed(db, { id: 'r-dismissed', status: 'dismissed' });
+    seed(db, { id: 'r-failed', status: 'failed' });
+    seed(db, { id: 'r-approved', status: 'approved' });
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(calls, {});
+      for (const id of ['r-applied', 'r-dismissed', 'r-failed', 'r-approved']) {
+        const result = await client.callTool({ name: 'queue_apply', arguments: { id } });
+        assert.ok(result.isError, `should error for ${id}`);
+      }
+      assert.equal(calls.length, 0, 'no API calls for refused statuses');
+      // failed records point the agent at the retry path
+      const failedResult = await client.callTool({ name: 'queue_apply', arguments: { id: 'r-failed' } });
+      assert.match(failedResult.content[0].text, /pending/);
+    } finally {
+      await close();
+    }
+  });
+
+  it('double-apply is impossible: the second apply errors and nothing mutates', async () => {
+    const db = makeQueueDb();
+    seedSplitRec(db);
+    const { client, close } = await createTestPair(db);
+    try {
+      installMockFetch(
+        calls,
+        { getTransaction: LIVE_CLEAN },
+        { updateTransactionSplit: { transaction: { id: 'txn-1', hasSplitTransactions: true, splitTransactions: [] }, errors: null } },
+        { householdTransactionTags: [{ id: 'tag-ext', name: 'Ext Processed', color: null, order: 1 }] },
+        { setTransactionTags: { transaction: { id: 'txn-1', tags: [] }, errors: null } }
+      );
+      const first = await client.callTool({ name: 'queue_apply', arguments: { id: 'r1' } });
+      assert.equal(parseResult(first).ok, true);
+      const callsAfterFirst = calls.length;
+
+      const second = await client.callTool({ name: 'queue_apply', arguments: { id: 'r1' } });
+      assert.ok(second.isError, 'second apply must error');
+      assert.equal(calls.length, callsAfterFirst, 'no further API calls');
+      assert.equal(getRecord(db, 'r1').revision, 2, 'revision bumped exactly once');
+    } finally {
+      await close();
+    }
+  });
+
+  it('errors on unknown ids', async () => {
+    const { client, close } = await createTestPair(makeQueueDb());
+    try {
+      installMockFetch(calls, {});
+      const result = await client.callTool({ name: 'queue_apply', arguments: { id: 'nope' } });
+      assert.ok(result.isError);
+      assert.match(result.content[0].text, /not found/i);
+      assert.equal(calls.length, 0);
+    } finally {
+      await close();
+    }
+  });
+});
+
 // ─── monarch://queue/stats resource ─────────────────────────────────────
 
 describe('queue/stats resource', () => {

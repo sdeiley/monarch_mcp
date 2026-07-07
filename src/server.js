@@ -334,6 +334,28 @@ function registerQueueTools(server, getQueueDb) {
       return { ok: true, record };
     })
   );
+
+  server.registerTool(
+    'queue_apply',
+    {
+      description: 'Execute a queued recommendation against the live Monarch account: preflights ' +
+        'the target transaction (refuses and marks the record stale if it already carries the ' +
+        '"Ext Processed" tag or has splits), runs the proposed diff (split and/or update), sets ' +
+        'the "Ext Processed" tag, and marks the record applied by the agent. On mutation error ' +
+        'the record is marked failed (reset to pending via queue_update_status to retry). ' +
+        'Use dry_run to see the preflight and mutation plan without writing.' +
+        WRITE_WARNING,
+      inputSchema: z.object({
+        id: z.string().describe('Recommendation id (from queue_list)'),
+        dry_run: z.boolean().default(false)
+          .describe('Preflight and plan only — no mutations, no status change'),
+      }),
+    },
+    queueHandler(async ({ id, dry_run }) => {
+      const token = loadToken();
+      return applyRecord(getQueueDb(), token, { id, dryRun: dry_run });
+    })
+  );
 }
 
 // ─── Write tools (live Monarch API mutations) ───────────────────────────
