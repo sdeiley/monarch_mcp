@@ -2,7 +2,7 @@
 
 MCP server for querying and managing [Monarch Money](https://www.monarch.com/) personal finance data.
 
-Provides read-only SQL access to your transactions via a local SQLite mirror, plus a refresh tool to sync from the Monarch API. Works with Claude Code, Claude Desktop, and any MCP-compatible client.
+Provides read-only SQL access to your transactions via a local SQLite mirror, a refresh tool to sync from the Monarch API, and write tools to update, split, tag, and rule-manage transactions in your live Monarch account. Works with Claude Code, Claude Desktop, and any MCP-compatible client.
 
 ## What Makes This Different
 
@@ -13,9 +13,10 @@ Most Monarch Money MCP servers are **API passthroughs** — each tool call hits 
 - **MCP Resources** — the only Monarch MCP that exposes schema, accounts, categories, and tags as MCP resources. This gives AI clients the metadata they need to write good queries without burning tool calls.
 - **Token-efficient** — pre-computed resources and SQL-level filtering mean only relevant data crosses the wire. Other servers return full API payloads on every call.
 - **Zero native dependencies** — uses Node.js built-in `node:sqlite`, no compiled extensions. Just `npm install` and go.
-- **62 tests** — fixture-based test suite with no dependency on real financial data.
+- **102 tests** — fixture-based test suite with no dependency on real financial data; write tools are tested against a mocked API.
+- **Write tools** — update, split, and tag transactions, and manage auto-categorization rules, directly against the live Monarch API. Designed for the "extension/mirror as read-only sensor, agent as sole writer" architecture.
 
-**Trade-off:** This server focuses on transaction analysis (read-only SQL). For budgets, investments, cashflow, or write operations, pair it with an API-passthrough MCP like [robcerda/monarch-mcp-server](https://github.com/robcerda/monarch-mcp-server).
+**Trade-off:** This server focuses on transactions (SQL analysis + write operations). For budgets, investments, or cashflow, pair it with an API-passthrough MCP like [robcerda/monarch-mcp-server](https://github.com/robcerda/monarch-mcp-server).
 
 ## Requirements
 
@@ -99,6 +100,26 @@ The server exposes 4 read-only resources:
 |------|-------------|
 | `query_transactions` | Execute read-only SQL (SELECT/WITH) against the transactions table |
 | `refresh_transactions` | Refresh local DB from Monarch API (`recent` = 3 months, `full` = all history) |
+| `update_transaction` | Set category, merchant name, notes, hide-from-reports, needs-review on a transaction (write) |
+| `split_transaction` | Replace a transaction's splits; amounts must sum exactly to the parent; empty array clears splits (write) |
+| `create_tag` | Create a new transaction tag, returns the tag with its ID (write) |
+| `set_transaction_tags` | Replace the full tag set on a transaction (write) |
+| `list_rules` | List all transaction rules with criteria/actions (live API read) |
+| `create_rule` | Create an auto-categorization rule (criteria + actions) (write) |
+| `update_rule` | Update an existing rule by ID (write) |
+| `delete_rule` | Delete a rule by ID (write) |
+
+### Write tools
+
+The tools marked "(write)" **mutate your live Monarch Money account** — they are not sandboxed and there is no undo. AI agents should confirm with the user before calling any of them.
+
+Notes:
+
+- After a successful write, the tool returns the mutated entity from the API response so the result can be verified.
+- The local SQLite mirror is **not** updated by writes — it is stale for affected transactions until you run `refresh_transactions`.
+- `split_transaction` validates that split amounts sum exactly to the live parent transaction amount (to the cent) before calling the API. Amounts are negative for expenses.
+- `set_transaction_tags` replaces the complete tag set; include existing tag IDs you want to keep.
+- Rule create/update mutations return no rule entity (Monarch API limitation); use `list_rules` to confirm.
 
 ### Transaction Table Columns
 
@@ -139,7 +160,7 @@ monarch-mcp --help    # Show help
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MONARCH_TOKEN` | Auth token (required for refresh) | — |
+| `MONARCH_TOKEN` | Auth token (required for refresh and all write tools) | — |
 | `MONARCH_DATA_DIR` | Data directory path | `~/.monarch` |
 
 ## Development

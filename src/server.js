@@ -57,11 +57,18 @@ export function createServer() {
     },
     {
       instructions:
-        'Monarch Money personal finance server backed by a local SQLite mirror.\n\n' +
+        'Monarch Money personal finance server backed by a local SQLite mirror, ' +
+        'with write tools that mutate the live Monarch account.\n\n' +
         'RESOURCES vs TOOLS:\n' +
         '- For lists of accounts, categories, or tags → read the monarch:// resource (fast, pre-computed)\n' +
         '- For filtered/aggregated transaction queries → use query_transactions tool with SQL\n' +
         '- To update the local mirror from the live API → use refresh_transactions tool\n\n' +
+        'WRITE TOOLS (update_transaction, split_transaction, create_tag, set_transaction_tags, ' +
+        'create_rule, update_rule, delete_rule) mutate the user\'s REAL Monarch account. ' +
+        'Confirm with the user before calling them. After a write, the local mirror is stale ' +
+        'for the affected transactions until refresh_transactions is run. ' +
+        'Transaction/category/tag IDs come from the local mirror (query_transactions and ' +
+        'monarch:// resources); rule IDs come from list_rules.\n\n' +
         'The transactions table has columns: id, amount, date, merchant_name, plaid_name, ' +
         'category_name, category_group, category_type, account_name, notes, tags, ' +
         'is_split, parent_id, pending, is_recurring. ' +
