@@ -153,3 +153,142 @@ describe('update_transaction tool', () => {
     assert.match(result.content[0].text, /Category not found/);
   });
 });
+
+describe('split_transaction tool', () => {
+  let client, close, calls, originalFetch;
+
+  before(async () => { ({ client, close } = await createTestPair()); });
+  after(async () => { await close(); });
+  beforeEach(() => { calls = []; originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  const SPLITS = [
+    { amount: -10.00, categoryId: 'c1', merchantName: 'Item A', notes: 'first' },
+    { amount: -5.50, categoryId: 'c2', merchantName: 'Item B' },
+  ];
+
+  it('validates split sum against the live parent amount, then applies the split', async () => {
+    installMockFetch(
+      calls,
+      // 1st call: getTransaction for validation
+      { getTransaction: { id: 'txn-1', amount: -15.50, hasSplitTransactions: false } },
+      // 2nd call: the split mutation
+      {
+        updateTransactionSplit: {
+          transaction: {
+            id: 'txn-1',
+            hasSplitTransactions: true,
+            splitTransactions: [
+              { id: 's1', amount: -10.00, notes: 'first', merchant: { id: 'm1', name: 'Item A' }, category: { id: 'c1', name: 'Software' } },
+              { id: 's2', amount: -5.50, notes: null, merchant: { id: 'm2', name: 'Item B' }, category: { id: 'c2', name: 'Games' } },
+            ],
+          },
+          errors: null,
+        },
+      }
+    );
+
+    const result = await client.callTool({
+      name: 'split_transaction',
+      arguments: { transactionId: 'txn-1', splits: SPLITS },
+    });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    assert.equal(calls.length, 2, 'should fetch parent then mutate');
+    assert.match(calls[0].body.query, /GetTransactionDrawer/);
+    assert.match(calls[1].body.query, /Common_SplitTransactionMutation/);
+    assert.deepEqual(calls[1].body.variables, {
+      input: { transactionId: 'txn-1', splitData: SPLITS },
+    });
+
+    const txn = JSON.parse(result.content[0].text);
+    assert.equal(txn.hasSplitTransactions, true);
+    assert.equal(txn.splitTransactions.length, 2);
+  });
+
+  it('rejects splits whose amounts do not sum to the parent amount, without mutating', async () => {
+    installMockFetch(
+      calls,
+      { getTransaction: { id: 'txn-1', amount: -20.00, hasSplitTransactions: false } }
+    );
+
+    const result = await client.callTool({
+      name: 'split_transaction',
+      arguments: { transactionId: 'txn-1', splits: SPLITS },
+    });
+
+    assert.ok(result.isError, 'should be an error');
+    assert.match(result.content[0].text, /-15\.5/, 'should include the split sum');
+    assert.match(result.content[0].text, /-20/, 'should include the parent amount');
+    assert.equal(calls.length, 1, 'must not call the split mutation');
+  });
+
+  it('accepts amounts that match to the cent despite float rounding', async () => {
+    installMockFetch(
+      calls,
+      { getTransaction: { id: 'txn-1', amount: -0.30, hasSplitTransactions: false } },
+      {
+        updateTransactionSplit: {
+          transaction: { id: 'txn-1', hasSplitTransactions: true, splitTransactions: [] },
+          errors: null,
+        },
+      }
+    );
+
+    const result = await client.callTool({
+      name: 'split_transaction',
+      arguments: {
+        transactionId: 'txn-1',
+        splits: [
+          { amount: -0.1, categoryId: 'c1', merchantName: 'A' },
+          { amount: -0.2, categoryId: 'c2', merchantName: 'B' },
+        ],
+      },
+    });
+
+    // -0.1 + -0.2 === -0.30000000000000004 in floats; must still pass
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    assert.equal(calls.length, 2);
+  });
+
+  it('clears splits with an empty array, skipping sum validation', async () => {
+    installMockFetch(calls, {
+      updateTransactionSplit: {
+        transaction: { id: 'txn-1', hasSplitTransactions: false, splitTransactions: [] },
+        errors: null,
+      },
+    });
+
+    const result = await client.callTool({
+      name: 'split_transaction',
+      arguments: { transactionId: 'txn-1', splits: [] },
+    });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    assert.equal(calls.length, 1, 'should not need to fetch the parent');
+    assert.deepEqual(calls[0].body.variables, {
+      input: { transactionId: 'txn-1', splitData: [] },
+    });
+  });
+
+  it('surfaces API payload errors as tool errors', async () => {
+    installMockFetch(
+      calls,
+      { getTransaction: { id: 'txn-1', amount: -15.50, hasSplitTransactions: false } },
+      {
+        updateTransactionSplit: {
+          transaction: null,
+          errors: [{ message: 'Something went wrong', code: 'error', fieldErrors: null }],
+        },
+      }
+    );
+
+    const result = await client.callTool({
+      name: 'split_transaction',
+      arguments: { transactionId: 'txn-1', splits: SPLITS },
+    });
+
+    assert.ok(result.isError, 'should be an error');
+    assert.match(result.content[0].text, /Something went wrong/);
+  });
+});

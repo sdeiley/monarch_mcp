@@ -135,4 +135,79 @@ describe('Monarch API write client', () => {
       );
     });
   });
+
+  describe('splitTransaction', () => {
+    it('sends the Common_SplitTransactionMutation operation with transactionId and splitData', async () => {
+      mockFetch({
+        updateTransactionSplit: {
+          transaction: {
+            id: 't1',
+            hasSplitTransactions: true,
+            splitTransactions: [
+              { id: 's1', amount: -10.00, notes: 'a', merchant: { id: 'm1', name: 'Item A' }, category: { id: 'c1', name: 'Software' } },
+              { id: 's2', amount: -5.50, notes: 'b', merchant: { id: 'm2', name: 'Item B' }, category: { id: 'c2', name: 'Games' } },
+            ],
+          },
+          errors: null,
+        },
+      });
+
+      const splitData = [
+        { merchantName: 'Item A', amount: -10.00, categoryId: 'c1', notes: 'a' },
+        { merchantName: 'Item B', amount: -5.50, categoryId: 'c2', notes: 'b' },
+      ];
+      const txn = await api.splitTransaction(FAKE_TOKEN, 't1', splitData);
+
+      const { body } = lastCall();
+      assert.match(body.query, /mutation Common_SplitTransactionMutation\(\$input: UpdateTransactionSplitMutationInput!\)/);
+      assert.match(body.query, /updateTransactionSplit\(input: \$input\)/);
+      assert.deepEqual(body.variables, { input: { transactionId: 't1', splitData } });
+      assert.equal(txn.hasSplitTransactions, true);
+      assert.equal(txn.splitTransactions.length, 2);
+    });
+
+    it('sends an empty splitData array to clear splits', async () => {
+      mockFetch({
+        updateTransactionSplit: {
+          transaction: { id: 't1', hasSplitTransactions: false, splitTransactions: [] },
+          errors: null,
+        },
+      });
+
+      const txn = await api.splitTransaction(FAKE_TOKEN, 't1', []);
+
+      assert.deepEqual(lastCall().body.variables, { input: { transactionId: 't1', splitData: [] } });
+      assert.equal(txn.hasSplitTransactions, false);
+    });
+
+    it('throws when the payload contains API-level errors', async () => {
+      mockFetch({
+        updateTransactionSplit: {
+          transaction: null,
+          errors: [{ message: 'Split amounts must sum to transaction amount', code: 'invalid', fieldErrors: null }],
+        },
+      });
+
+      await assert.rejects(
+        () => api.splitTransaction(FAKE_TOKEN, 't1', [{ merchantName: 'X', amount: -1, categoryId: 'c1' }]),
+        /splitTransaction failed: Split amounts must sum/
+      );
+    });
+  });
+
+  describe('getTransaction', () => {
+    it('queries getTransaction by UUID id', async () => {
+      mockFetch({
+        getTransaction: { id: 't1', amount: -15.50, hasSplitTransactions: false },
+      });
+
+      const txn = await api.getTransaction(FAKE_TOKEN, 't1');
+
+      const { body } = lastCall();
+      assert.match(body.query, /query GetTransactionDrawer\(\$id: UUID!\)/);
+      assert.match(body.query, /getTransaction\(id: \$id\)/);
+      assert.deepEqual(body.variables, { id: 't1' });
+      assert.equal(txn.amount, -15.50);
+    });
+  });
 });

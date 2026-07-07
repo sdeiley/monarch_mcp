@@ -253,4 +253,47 @@ function registerWriteTools(server) {
       return api.updateTransaction(token, input);
     })
   );
+
+  server.registerTool(
+    'split_transaction',
+    {
+      description: 'Replace a Monarch transaction\'s splits. Each split gets its own amount, ' +
+        'category, merchant name, and optional notes. Split amounts MUST sum exactly to the ' +
+        'parent transaction amount (amounts are negative for expenses) — validated against the ' +
+        'live parent amount before applying. Pass an empty splits array to remove all splits. ' +
+        'Returns the parent transaction with its splitTransactions.' +
+        WRITE_WARNING,
+      inputSchema: z.object({
+        transactionId: z.string().describe('Parent Monarch transaction ID (UUID)'),
+        splits: z.array(z.object({
+          amount: z.number().describe('Split amount (negative for expenses); all splits must sum to the parent amount'),
+          categoryId: z.string().describe('Category ID for this split'),
+          merchantName: z.string().describe('Display name for this split item'),
+          notes: z.string().optional().describe('Notes for this split'),
+        })).describe('Complete replacement set of splits; empty array clears existing splits'),
+      }),
+    },
+    writeHandler(async (token, { transactionId, splits }) => {
+      if (splits.length > 0) {
+        // Validate against the live parent amount, not the local mirror.
+        const parent = await api.getTransaction(token, transactionId);
+        if (!parent) {
+          throw new Error(`Transaction ${transactionId} not found`);
+        }
+        const sumCents = Math.round(
+          splits.reduce((total, s) => total + Math.round(s.amount * 100), 0)
+        );
+        const parentCents = Math.round(parent.amount * 100);
+        if (sumCents !== parentCents) {
+          throw new Error(
+            `Split amounts sum to ${(sumCents / 100).toFixed(2)} but the transaction amount is ` +
+            `${(parentCents / 100).toFixed(2)}. Splits must sum exactly to the parent amount ` +
+            '(remember: amounts are negative for expenses).'
+          );
+        }
+      }
+
+      return api.splitTransaction(token, transactionId, splits);
+    })
+  );
 }
