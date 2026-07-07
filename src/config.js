@@ -25,3 +25,12 @@ export function resolveDataDir() {
 export function resolveDbPath(dataDir) {
   return path.join(dataDir ?? resolveDataDir(), 'monarch.db');
 }
+
+/**
+ * Resolve the full path to the recommendation queue database.
+ * @param {string} [dataDir] - Override data directory (defaults to resolveDataDir())
+ * @returns {string}
+ */
+export function resolveQueueDbPath(dataDir) {
+  return path.join(dataDir ?? resolveDataDir(), 'queue.db');
+}
