@@ -356,6 +356,38 @@ function registerQueueTools(server, getQueueDb) {
       return applyRecord(getQueueDb(), token, { id, dryRun: dry_run });
     })
   );
+
+  server.registerTool(
+    'queue_sweep',
+    {
+      description: 'Housekeep the recommendation queue: mark active records stale when their ' +
+        'target transaction in the local monarch.db mirror is missing, already tagged ' +
+        '"Ext Processed", already split, or recategorized; then purge old terminal records ' +
+        '(applied 7d, dismissed 30d, stale 7d, failed 14d; 500-record soft cap). ' +
+        'Only touches the local queue database, never the live Monarch account. ' +
+        'Run refresh_transactions first for an up-to-date staleness check.',
+      inputSchema: z.object({}),
+    },
+    queueHandler(() => {
+      return sweep(getQueueDb(), { lookupMirrorTxns: lookupMirrorTransactions });
+    })
+  );
+}
+
+/**
+ * Default mirror lookup for queue_sweep: fetch target transactions from the
+ * local monarch.db mirror. Ids are quoted (not interpolated raw) because
+ * queryDb only accepts a SQL string.
+ * @param {string[]} ids
+ * @returns {Map<string, object>}
+ */
+function lookupMirrorTransactions(ids) {
+  if (ids.length === 0) return new Map();
+  const quoted = ids.map(id => `'${String(id).replace(/'/g, "''")}'`).join(', ');
+  const rows = queryDb(
+    `SELECT id, category_id, has_splits, tags FROM transactions WHERE id IN (${quoted})`
+  );
+  return new Map(rows.map(r => [r.id, r]));
 }
 
 // ─── Write tools (live Monarch API mutations) ───────────────────────────

@@ -631,6 +631,65 @@ describe('queue_apply tool', () => {
   });
 });
 
+// ─── queue_sweep ────────────────────────────────────────────────────────
+
+describe('queue_sweep tool', () => {
+  it('is registered', async () => {
+    const { client, close } = await createTestPair(makeQueueDb());
+    try {
+      const { tools } = await client.listTools();
+      assert.ok(tools.some(t => t.name === 'queue_sweep'));
+    } finally {
+      await close();
+    }
+  });
+
+  it('stales records against the monarch.db mirror and purges per retention', async () => {
+    const db = makeQueueDb();
+    const old = (days) => new Date(Date.now() - days * 86400e3).toISOString();
+    // Fixture mirror: txn-001 has has_splits=1; txn-002 is clean with cat-002.
+    seed(db, { id: 'sw1', status: 'pending', target_txn_id: 'txn-001' });
+    seed(db, { id: 'sw2', status: 'pending', target_txn_id: 'ghost-txn' });
+    seed(db, {
+      id: 'sw3', status: 'pending', target_txn_id: 'txn-002',
+      payload: { target: { categoryId: 'cat-002' }, diff: {} },
+    });
+    seed(db, { id: 'sw4', status: 'applied', target_txn_id: 'txn-003', updated_at: old(60), applied_at: old(60) });
+
+    const { client, close } = await createTestPair(db);
+    try {
+      const result = await client.callTool({ name: 'queue_sweep', arguments: {} });
+      assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+      const data = parseResult(result);
+      assert.equal(data.staled, 2, 'split target + missing target stale');
+      assert.equal(data.purged, 1, 'old applied record purged');
+      assert.equal(data.remaining, 3);
+
+      assert.equal(getRecord(db, 'sw1').status, 'stale');
+      assert.equal(getRecord(db, 'sw2').status, 'stale');
+      assert.equal(getRecord(db, 'sw3').status, 'pending', 'clean record untouched');
+      assert.equal(getRecord(db, 'sw4'), null);
+    } finally {
+      await close();
+    }
+  });
+
+  it('returns cleanly on an empty queue', async () => {
+    const { client, close } = await createTestPair(makeQueueDb());
+    try {
+      const result = await client.callTool({ name: 'queue_sweep', arguments: {} });
+      assert.ok(!result.isError);
+      const data = parseResult(result);
+      assert.deepEqual(
+        { staled: data.staled, purged: data.purged, remaining: data.remaining },
+        { staled: 0, purged: 0, remaining: 0 }
+      );
+    } finally {
+      await close();
+    }
+  });
+});
+
 // ─── monarch://queue/stats resource ─────────────────────────────────────
 
 describe('queue/stats resource', () => {
