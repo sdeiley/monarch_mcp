@@ -12,12 +12,13 @@ src/
   fetch.js         # Monarch GraphQL API transaction fetcher
   import.js        # JSON → SQLite importer with upsert + pending prune
   refresh.js       # Async orchestrator: fetch → import
-  server.js        # MCP server factory: 4 resources + 2 tools
+  api.js           # Monarch GraphQL write client (mutations + live reads)
+  server.js        # MCP server factory: 4 resources + 10 tools
   bin/
     stdio.js       # stdio transport entry point
     cli.js         # CLI: init, refresh, serve
 test/
-  *.test.js        # node:test suite (62 tests)
+  *.test.js        # node:test suite (102 tests)
   fixtures/
     monarch.db     # Committed 5-row fixture DB
     create-fixture-db.js  # Regenerates the fixture
@@ -33,7 +34,7 @@ test/
 ## Running Tests
 
 ```bash
-npm test                          # All 62 tests
+npm test                          # All 102 tests
 node --test test/db.test.js       # Single file
 ```
 
@@ -54,5 +55,18 @@ node --test test/db.test.js       # Single file
 
 ## MCP Tools
 
+Read:
+
 - `query_transactions(sql)` — Read-only SQL (SELECT/WITH only)
 - `refresh_transactions(mode)` — `recent` (3 months) or `full` (all history)
+- `list_rules()` — All TransactionRuleV2 rules (live API read)
+
+Write (mutate the LIVE Monarch account; agents must confirm with the user first; local mirror is stale until `refresh_transactions`):
+
+- `update_transaction(id, ...)` — category, merchant name, notes, hideFromReports, needsReview
+- `split_transaction(transactionId, splits)` — replace splits; amounts must sum exactly to parent; `[]` clears
+- `create_tag(name, color?)` — returns created tag with ID
+- `set_transaction_tags(transactionId, tagIds)` — replaces the full tag set
+- `create_rule(...)` / `update_rule(id, ...)` / `delete_rule(id)` — TransactionRuleV2 CRUD
+
+Write-tool conventions (`src/api.js`): endpoint `https://api.monarch.com/graphql`, header `Authorization: Token <token>` (not Bearer) + `Client-Platform: web`. Payload-level `errors` arrays are surfaced as thrown errors. Never log or echo the token.
