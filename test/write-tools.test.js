@@ -292,3 +292,120 @@ describe('split_transaction tool', () => {
     assert.match(result.content[0].text, /Something went wrong/);
   });
 });
+
+describe('create_tag tool', () => {
+  let client, close, calls, originalFetch;
+
+  before(async () => { ({ client, close } = await createTestPair()); });
+  after(async () => { await close(); });
+  beforeEach(() => { calls = []; originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it('creates a tag and returns the created tag with its ID', async () => {
+    installMockFetch(
+      calls,
+      { createTransactionTag: { __typename: 'CreateTransactionTagPayload' } },
+      { householdTransactionTags: [
+        { id: 'tag-9', name: 'Reimbursable', color: '#e07a5f', order: 5 },
+      ] }
+    );
+
+    const result = await client.callTool({
+      name: 'create_tag',
+      arguments: { name: 'Reimbursable', color: '#e07a5f' },
+    });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    assert.match(calls[0].body.query, /Common_CreateTransactionTag/);
+    assert.deepEqual(calls[0].body.variables, { input: { name: 'Reimbursable', color: '#e07a5f' } });
+
+    const tag = JSON.parse(result.content[0].text);
+    assert.equal(tag.id, 'tag-9');
+    assert.equal(tag.name, 'Reimbursable');
+  });
+
+  it('surfaces GraphQL errors as tool errors', async () => {
+    globalThis.fetch = () => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        errors: [{ message: 'Tag name already exists' }],
+      }),
+    });
+
+    const result = await client.callTool({
+      name: 'create_tag',
+      arguments: { name: 'Duplicate' },
+    });
+
+    assert.ok(result.isError, 'should be an error');
+    assert.match(result.content[0].text, /Tag name already exists/);
+  });
+});
+
+describe('set_transaction_tags tool', () => {
+  let client, close, calls, originalFetch;
+
+  before(async () => { ({ client, close } = await createTestPair()); });
+  after(async () => { await close(); });
+  beforeEach(() => { calls = []; originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it('replaces the tag set and returns the transaction tags', async () => {
+    installMockFetch(calls, {
+      setTransactionTags: {
+        transaction: { id: 'txn-1', tags: [{ id: 'tag-1', name: 'Apple', color: '#f00', order: 1 }] },
+        errors: null,
+      },
+    });
+
+    const result = await client.callTool({
+      name: 'set_transaction_tags',
+      arguments: { transactionId: 'txn-1', tagIds: ['tag-1'] },
+    });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    assert.match(calls[0].body.query, /Web_SetTransactionTags/);
+    assert.deepEqual(calls[0].body.variables, {
+      input: { transactionId: 'txn-1', tagIds: ['tag-1'] },
+    });
+
+    const txn = JSON.parse(result.content[0].text);
+    assert.equal(txn.tags[0].id, 'tag-1');
+  });
+
+  it('accepts an empty tagIds array to clear tags', async () => {
+    installMockFetch(calls, {
+      setTransactionTags: {
+        transaction: { id: 'txn-1', tags: [] },
+        errors: null,
+      },
+    });
+
+    const result = await client.callTool({
+      name: 'set_transaction_tags',
+      arguments: { transactionId: 'txn-1', tagIds: [] },
+    });
+
+    assert.ok(!result.isError);
+    assert.deepEqual(calls[0].body.variables, {
+      input: { transactionId: 'txn-1', tagIds: [] },
+    });
+  });
+
+  it('surfaces API payload errors as tool errors', async () => {
+    installMockFetch(calls, {
+      setTransactionTags: {
+        transaction: null,
+        errors: [{ message: 'Tag not found', code: 'not_found', fieldErrors: null }],
+      },
+    });
+
+    const result = await client.callTool({
+      name: 'set_transaction_tags',
+      arguments: { transactionId: 'txn-1', tagIds: ['bogus'] },
+    });
+
+    assert.ok(result.isError, 'should be an error');
+    assert.match(result.content[0].text, /Tag not found/);
+  });
+});

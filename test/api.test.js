@@ -195,6 +195,59 @@ describe('Monarch API write client', () => {
     });
   });
 
+  describe('setTransactionTags', () => {
+    it('sends the Web_SetTransactionTags operation with transactionId and tagIds', async () => {
+      mockFetch({
+        setTransactionTags: {
+          transaction: { id: 't1', tags: [{ id: 'tag1', name: 'Apple', color: '#f00', order: 1 }] },
+          errors: null,
+        },
+      });
+
+      const txn = await api.setTransactionTags(FAKE_TOKEN, 't1', ['tag1']);
+
+      const { body } = lastCall();
+      assert.match(body.query, /mutation Web_SetTransactionTags\(\$input: SetTransactionTagsInput!\)/);
+      assert.match(body.query, /setTransactionTags\(input: \$input\)/);
+      assert.deepEqual(body.variables, { input: { transactionId: 't1', tagIds: ['tag1'] } });
+      assert.equal(txn.tags[0].name, 'Apple');
+    });
+
+    it('throws when the payload contains API-level errors', async () => {
+      mockFetch({
+        setTransactionTags: {
+          transaction: null,
+          errors: [{ message: 'Tag not found', code: 'not_found', fieldErrors: null }],
+        },
+      });
+
+      await assert.rejects(
+        () => api.setTransactionTags(FAKE_TOKEN, 't1', ['bogus']),
+        /setTransactionTags failed: Tag not found/
+      );
+    });
+  });
+
+  describe('createTag', () => {
+    it('creates the tag then re-fetches tags to return the created one', async () => {
+      mockFetch(
+        { createTransactionTag: { __typename: 'CreateTransactionTagPayload' } },
+        { householdTransactionTags: [
+          { id: 'tag1', name: 'Existing', color: '#0f0', order: 1 },
+          { id: 'tag2', name: 'NewTag', color: '#e07a5f', order: 2 },
+        ] }
+      );
+
+      const tag = await api.createTag(FAKE_TOKEN, 'NewTag', '#e07a5f');
+
+      assert.equal(calls.length, 2, 'create then fetch');
+      assert.match(calls[0].body.query, /mutation Common_CreateTransactionTag\(\$input: CreateTransactionTagInput!\)/);
+      assert.deepEqual(calls[0].body.variables, { input: { name: 'NewTag', color: '#e07a5f' } });
+      assert.match(calls[1].body.query, /householdTransactionTags/);
+      assert.deepEqual(tag, { id: 'tag2', name: 'NewTag', color: '#e07a5f', order: 2 });
+    });
+  });
+
   describe('getTransaction', () => {
     it('queries getTransaction by UUID id', async () => {
       mockFetch({

@@ -296,4 +296,37 @@ function registerWriteTools(server) {
       return api.splitTransaction(token, transactionId, splits);
     })
   );
+
+  server.registerTool(
+    'create_tag',
+    {
+      description: 'Create a new Monarch transaction tag. Returns the created tag with its ID.' +
+        WRITE_WARNING,
+      inputSchema: z.object({
+        name: z.string().describe('Tag name'),
+        color: z.string().optional().describe('Hex color, e.g. "#e07a5f"'),
+      }),
+    },
+    writeHandler(async (token, { name, color }) => {
+      return api.createTag(token, name, color);
+    })
+  );
+
+  server.registerTool(
+    'set_transaction_tags',
+    {
+      description: 'Replace the complete set of tags on a Monarch transaction. ' +
+        'Pass ALL desired tag IDs — existing tags not included are removed; an empty array clears all tags. ' +
+        'Returns the transaction with its updated tags.' +
+        WRITE_WARNING,
+      inputSchema: z.object({
+        transactionId: z.string().describe('Monarch transaction ID (UUID)'),
+        tagIds: z.array(z.string())
+          .describe('Complete replacement list of tag IDs (see monarch://tags for names; create_tag returns IDs)'),
+      }),
+    },
+    writeHandler(async (token, { transactionId, tagIds }) => {
+      return api.setTransactionTags(token, transactionId, tagIds);
+    })
+  );
 }
