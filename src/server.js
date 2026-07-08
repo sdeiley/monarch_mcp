@@ -550,7 +550,7 @@ const ruleFieldsSchema = {
 
   // Actions
   setCategoryAction: z.string().optional().describe('Category ID to assign'),
-  setMerchantAction: z.string().optional().describe('Merchant ID to assign (renames the transaction)'),
+  setMerchantAction: z.string().optional().describe('Merchant NAME to assign (renames the transaction). Must be an existing merchant name — passing an ID or unknown name silently creates a new merchant with that literal string as its name'),
   addTagsAction: z.array(z.string()).optional().describe('Tag IDs to add'),
   reviewStatusAction: z.enum(['reviewed', 'needs_review']).optional(),
   setHideFromReportsAction: z.boolean().optional(),
