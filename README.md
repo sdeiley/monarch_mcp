@@ -122,8 +122,8 @@ The tools marked "(write)" **mutate your live Monarch Money account** — they a
 
 Notes:
 
-- After a successful write, the tool returns the mutated entity from the API response so the result can be verified.
-- The local SQLite mirror is **not** updated by writes — it is stale for affected transactions until you run `refresh_transactions`.
+- The transaction write tools (`update_transaction`, `split_transaction`, `set_transaction_tags`) **self-verify and self-sync**: after the mutation, the tool re-fetches the transaction from the live API, verifies the requested changes took effect, and upserts the live state (including split children) into the local mirror. The result is `{ transaction, verification, mirror }` — when `verification.verified` and `mirror.synced` are both true, no `refresh_transactions` is needed; otherwise the result carries a warning (and mismatch details) and the mirror is stale for that transaction until `refresh_transactions` is run. A mismatch usually means a Monarch rule or concurrent edit overrode the change.
+- Rule writes (`create_rule` / `update_rule` / `delete_rule`, especially with `applyToExistingTransactions`) can affect many transactions at once and still leave the mirror stale until `refresh_transactions`.
 - `split_transaction` validates that split amounts sum exactly to the live parent transaction amount (to the cent) before calling the API. Amounts are negative for expenses.
 - `set_transaction_tags` replaces the complete tag set; include existing tag IDs you want to keep.
 - Rule create/update mutations return no rule entity (Monarch API limitation); use `list_rules` to confirm.
@@ -138,7 +138,7 @@ The agent-side review workflow:
 2. After the user approves, `queue_apply` each approved id (`dry_run: true` first to preview the mutation plan).
 3. `queue_sweep` occasionally to mark stale records and purge old terminal ones.
 
-`queue_apply` is safer than the raw write tools for queued items: it re-fetches the live transaction and refuses (marking the record `stale`) if the transaction already carries the `"Ext Processed"` tag or has splits, validates split sums against the live amount, sets `"Ext Processed"` on success, and records the outcome (`applied` / `failed`) with a guarded status transition so double-apply is impossible — even if the extension raced it. Status lifecycle: `pending → applied|dismissed|stale`, `failed → pending` for retry; `applied`/`dismissed` are terminal.
+`queue_apply` is safer than the raw write tools for queued items: it re-fetches the live transaction and refuses (marking the record `stale`) if the transaction already carries the `"Ext Processed"` tag or has splits, validates split sums against the live amount, sets `"Ext Processed"` on success, and records the outcome (`applied` / `failed`) with a guarded status transition so double-apply is impossible — even if the extension raced it. After a successful apply, the target transaction is re-fetched and synced into the local mirror (`mirror` in the result). Status lifecycle: `pending → applied|dismissed|stale`, `failed → pending` for retry; `applied`/`dismissed` are terminal.
 
 The queue database is created lazily; if the extension side isn't installed the queue tools simply report an empty queue.
 

@@ -1,15 +1,37 @@
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
-// Point to fixture DB and inject a fake token so loadToken() never
-// touches the real ~/.monarch-token.
+// Write tools sync the mirror after each write, so point MONARCH_DATA_DIR at
+// a throwaway COPY of the fixture DB — never the committed fixture itself.
+// Also inject a fake token so loadToken() never touches ~/.monarch-token.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-process.env.MONARCH_DATA_DIR = path.join(__dirname, 'fixtures');
+const tmpDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monarch-write-tools-'));
+fs.copyFileSync(
+  path.join(__dirname, 'fixtures', 'monarch.db'),
+  path.join(tmpDataDir, 'monarch.db')
+);
+process.env.MONARCH_DATA_DIR = tmpDataDir;
 process.env.MONARCH_TOKEN = 'fake-test-token';
+process.on('exit', () => {
+  try { fs.rmSync(tmpDataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+});
+
+/** Read a row straight out of the temp mirror DB. */
+function mirrorRow(id) {
+  const db = new DatabaseSync(path.join(tmpDataDir, 'monarch.db'));
+  try {
+    return db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+  } finally {
+    db.close();
+  }
+}
 
 async function createTestPair() {
   const { createServer } = await import('../src/server.js');
@@ -49,11 +71,13 @@ describe('Write tools registration', () => {
     assert.ok(names.includes('update_transaction'), 'should have update_transaction');
   });
 
-  it('write tool descriptions warn about live account mutation and stale mirror', async () => {
+  it('write tool descriptions warn about live account mutation and describe verification', async () => {
     const result = await client.listTools();
     const tool = result.tools.find(t => t.name === 'update_transaction');
     assert.match(tool.description, /live/i, 'should mention live account');
-    assert.match(tool.description, /refresh_transactions/, 'should mention mirror refresh');
+    assert.match(tool.description, /verif/i, 'should mention read-back verification');
+    assert.match(tool.description, /mirror/i, 'should mention the mirror sync');
+    assert.match(tool.description, /refresh_transactions/, 'should mention the fallback refresh');
   });
 });
 
@@ -65,23 +89,38 @@ describe('update_transaction tool', () => {
   beforeEach(() => { calls = []; originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it('maps tool args to UpdateTransactionMutationInput and returns the mutated transaction', async () => {
-    installMockFetch(calls, {
-      updateTransaction: {
-        transaction: {
-          id: 'txn-1', notes: 'note here', hideFromReports: false, needsReview: false,
-          category: { id: 'cat-1', name: 'Software' },
-          merchant: { id: 'm-1', name: 'Renamed Merchant' },
+  it('mutates, reads back, verifies, and syncs the mirror', async () => {
+    // txn-002 exists in the fixture mirror as Netflix / Subscriptions.
+    const readBack = {
+      id: 'txn-002', amount: -15.99, date: '2026-01-16', originalDate: '2026-01-16',
+      pending: false, hideFromReports: false, needsReview: false, isRecurring: true,
+      plaidName: 'NETFLIX.COM', notes: 'note here',
+      isSplitTransaction: false, hasSplitTransactions: false, originalTransaction: null,
+      category: { id: 'cat-001', name: 'Groceries', group: { id: 'g1', name: 'Food & Dining', type: 'expense' } },
+      merchant: { id: 'm-1', name: 'Renamed Merchant' },
+      account: { id: 'acc-001', displayName: 'Checking (...1234)' },
+      tags: [], splitTransactions: [],
+    };
+    installMockFetch(
+      calls,
+      {
+        updateTransaction: {
+          transaction: {
+            id: 'txn-002', notes: 'note here', hideFromReports: false, needsReview: false,
+            category: { id: 'cat-001', name: 'Groceries' },
+            merchant: { id: 'm-1', name: 'Renamed Merchant' },
+          },
+          errors: null,
         },
-        errors: null,
       },
-    });
+      { getTransaction: readBack }
+    );
 
     const result = await client.callTool({
       name: 'update_transaction',
       arguments: {
-        id: 'txn-1',
-        categoryId: 'cat-1',
+        id: 'txn-002',
+        categoryId: 'cat-001',
         merchantName: 'Renamed Merchant',
         notes: 'note here',
         needsReview: false,
@@ -89,32 +128,114 @@ describe('update_transaction tool', () => {
     });
 
     assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 2, 'mutation then read-back');
     const { body, opts } = calls[0];
     assert.match(opts.headers['Authorization'], /^Token /);
     assert.match(body.query, /Web_TransactionDrawerUpdateTransaction/);
     assert.deepEqual(body.variables, {
       input: {
-        id: 'txn-1',
-        category: 'cat-1',
+        id: 'txn-002',
+        category: 'cat-001',
         name: 'Renamed Merchant',
         notes: 'note here',
         needsReview: false,
       },
     });
+    assert.match(calls[1].body.query, /GetTransactionDrawer/);
+    assert.deepEqual(calls[1].body.variables, { id: 'txn-002' });
 
-    const txn = JSON.parse(result.content[0].text);
-    assert.equal(txn.id, 'txn-1');
-    assert.equal(txn.merchant.name, 'Renamed Merchant');
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.transaction.id, 'txn-002');
+    assert.equal(data.transaction.merchant.name, 'Renamed Merchant');
+    assert.deepEqual(data.verification, { verified: true });
+    assert.equal(data.mirror.synced, true);
+
+    // The local mirror now holds the live state — no refresh needed.
+    const row = mirrorRow('txn-002');
+    assert.equal(row.merchant_name, 'Renamed Merchant');
+    assert.equal(row.category_id, 'cat-001');
+    assert.equal(row.category_name, 'Groceries');
+    assert.equal(row.category_group, 'Food & Dining');
+    assert.equal(row.notes, 'note here');
+  });
+
+  it('reports mismatches (but still syncs the live state) when the read-back differs', async () => {
+    installMockFetch(
+      calls,
+      {
+        updateTransaction: {
+          transaction: { id: 'txn-002', category: { id: 'cat-001', name: 'Groceries' } },
+          errors: null,
+        },
+      },
+      // A Monarch rule "won": the live category is not the one we set.
+      {
+        getTransaction: {
+          id: 'txn-002', amount: -15.99, date: '2026-01-16',
+          category: { id: 'cat-999', name: 'Entertainment', group: { id: 'g9', name: 'Fun', type: 'expense' } },
+          merchant: { id: 'm-1', name: 'Netflix' },
+          tags: [], splitTransactions: [],
+        },
+      }
+    );
+
+    const result = await client.callTool({
+      name: 'update_transaction',
+      arguments: { id: 'txn-002', categoryId: 'cat-001' },
+    });
+
+    assert.ok(!result.isError, 'a mismatch is a warning, not a tool error');
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.verification.verified, false);
+    assert.deepEqual(data.verification.mismatches, [
+      { field: 'categoryId', expected: 'cat-001', actual: 'cat-999' },
+    ]);
+    assert.match(data.verification.warning, /does not match/i);
+    assert.equal(data.mirror.synced, true, 'mirror is synced to the LIVE state');
+    assert.equal(mirrorRow('txn-002').category_id, 'cat-999');
+  });
+
+  it('returns success with a stale-mirror warning when the read-back fails', async () => {
+    let n = 0;
+    globalThis.fetch = (url, opts) => {
+      calls.push({ url, opts, body: JSON.parse(opts.body) });
+      n++;
+      if (n === 1) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            data: { updateTransaction: { transaction: { id: 'txn-002', notes: 'x' }, errors: null } },
+          }),
+        });
+      }
+      return Promise.reject(new Error('network down'));
+    };
+
+    const result = await client.callTool({
+      name: 'update_transaction',
+      arguments: { id: 'txn-002', notes: 'x' },
+    });
+
+    assert.ok(!result.isError, 'the write itself succeeded and must not be masked');
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.transaction.id, 'txn-002', 'falls back to the mutation payload');
+    assert.equal(data.verification.verified, false);
+    assert.match(data.verification.warning, /read-back failed/i);
+    assert.match(data.verification.warning, /refresh_transactions/);
+    assert.equal(data.mirror.synced, false);
   });
 
   it('sends date through to the mutation input when provided', async () => {
-    installMockFetch(calls, {
-      updateTransaction: {
-        transaction: { id: 'txn-3', date: '2026-03-14' },
-        errors: null,
+    installMockFetch(
+      calls,
+      {
+        updateTransaction: {
+          transaction: { id: 'txn-3', date: '2026-03-14' },
+          errors: null,
+        },
       },
-    });
+      { getTransaction: { id: 'txn-3', amount: -1, date: '2026-03-14' } }
+    );
 
     const result = await client.callTool({
       name: 'update_transaction',
@@ -125,6 +246,8 @@ describe('update_transaction tool', () => {
     assert.deepEqual(calls[0].body.variables, {
       input: { id: 'txn-3', date: '2026-03-14' },
     });
+    const data = JSON.parse(result.content[0].text);
+    assert.deepEqual(data.verification, { verified: true });
   });
 
   it('rejects a malformed date at the tool layer without calling the API', async () => {
@@ -148,9 +271,11 @@ describe('update_transaction tool', () => {
   });
 
   it('sends hideFromReports when provided', async () => {
-    installMockFetch(calls, {
-      updateTransaction: { transaction: { id: 'txn-2', hideFromReports: true }, errors: null },
-    });
+    installMockFetch(
+      calls,
+      { updateTransaction: { transaction: { id: 'txn-2', hideFromReports: true }, errors: null } },
+      { getTransaction: { id: 'txn-2', amount: -1, date: '2026-01-01', hideFromReports: true } }
+    );
 
     const result = await client.callTool({
       name: 'update_transaction',
@@ -206,7 +331,19 @@ describe('split_transaction tool', () => {
     { amount: -5.50, categoryId: 'c2', merchantName: 'Item B' },
   ];
 
-  it('validates split sum against the live parent amount, then applies the split', async () => {
+  it('validates split sum against the live parent amount, applies, verifies, and syncs children', async () => {
+    const readBack = {
+      id: 'txn-1', amount: -15.50, date: '2026-07-01', pending: false,
+      plaidName: 'CARD PURCHASE', isSplitTransaction: false, hasSplitTransactions: true,
+      account: { id: 'acc-9', displayName: 'Card' },
+      merchant: { id: 'm0', name: 'Store' },
+      category: { id: 'c0', name: 'Shopping', group: { id: 'g0', name: 'Shopping', type: 'expense' } },
+      tags: [],
+      splitTransactions: [
+        { id: 's1', amount: -10.00, notes: 'first', merchant: { id: 'm1', name: 'Item A' }, category: { id: 'c1', name: 'Software', group: { id: 'g1', name: 'Tech', type: 'expense' } }, tags: [] },
+        { id: 's2', amount: -5.50, notes: null, merchant: { id: 'm2', name: 'Item B' }, category: { id: 'c2', name: 'Games', group: { id: 'g1', name: 'Tech', type: 'expense' } }, tags: [] },
+      ],
+    };
     installMockFetch(
       calls,
       // 1st call: getTransaction for validation
@@ -224,7 +361,9 @@ describe('split_transaction tool', () => {
           },
           errors: null,
         },
-      }
+      },
+      // 3rd call: confirmation read-back
+      { getTransaction: readBack }
     );
 
     const result = await client.callTool({
@@ -233,16 +372,63 @@ describe('split_transaction tool', () => {
     });
 
     assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
-    assert.equal(calls.length, 2, 'should fetch parent then mutate');
+    assert.equal(calls.length, 3, 'should fetch parent, mutate, then read back');
     assert.match(calls[0].body.query, /GetTransactionDrawer/);
     assert.match(calls[1].body.query, /Common_SplitTransactionMutation/);
     assert.deepEqual(calls[1].body.variables, {
       input: { transactionId: 'txn-1', splitData: SPLITS },
     });
+    assert.match(calls[2].body.query, /GetTransactionDrawer/);
 
-    const txn = JSON.parse(result.content[0].text);
-    assert.equal(txn.hasSplitTransactions, true);
-    assert.equal(txn.splitTransactions.length, 2);
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.transaction.hasSplitTransactions, true);
+    assert.equal(data.transaction.splitTransactions.length, 2);
+    assert.deepEqual(data.verification, { verified: true });
+    assert.equal(data.mirror.synced, true);
+    assert.equal(data.mirror.upserted, 3, 'parent + two children');
+
+    // Parent and split children land in the mirror.
+    assert.equal(mirrorRow('txn-1').has_splits, 1);
+    const child = mirrorRow('s1');
+    assert.equal(child.parent_id, 'txn-1');
+    assert.equal(child.is_split, 1);
+    assert.equal(child.amount, -10.00);
+    assert.equal(child.category_name, 'Software');
+    assert.equal(child.account_name, 'Card', 'children inherit the parent account');
+    assert.equal(child.date, '2026-07-01', 'children inherit the parent date');
+  });
+
+  it('flags a verification mismatch when the live splits differ from the request', async () => {
+    installMockFetch(
+      calls,
+      { getTransaction: { id: 'txn-1', amount: -15.50, hasSplitTransactions: false } },
+      {
+        updateTransactionSplit: {
+          transaction: { id: 'txn-1', hasSplitTransactions: true, splitTransactions: [] },
+          errors: null,
+        },
+      },
+      // Read-back shows only ONE split survived.
+      {
+        getTransaction: {
+          id: 'txn-1', amount: -15.50, date: '2026-07-01', hasSplitTransactions: true,
+          splitTransactions: [
+            { id: 's1', amount: -15.50, merchant: { id: 'm1', name: 'Item A' }, category: { id: 'c1', name: 'Software' }, tags: [] },
+          ],
+        },
+      }
+    );
+
+    const result = await client.callTool({
+      name: 'split_transaction',
+      arguments: { transactionId: 'txn-1', splits: SPLITS },
+    });
+
+    assert.ok(!result.isError, 'a mismatch is a warning, not a tool error');
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.verification.verified, false);
+    assert.equal(data.verification.mismatches[0].field, 'splits');
+    assert.match(data.verification.warning, /does not match/i);
   });
 
   it('rejects splits whose amounts do not sum to the parent amount, without mutating', async () => {
@@ -271,6 +457,15 @@ describe('split_transaction tool', () => {
           transaction: { id: 'txn-1', hasSplitTransactions: true, splitTransactions: [] },
           errors: null,
         },
+      },
+      {
+        getTransaction: {
+          id: 'txn-1', amount: -0.30, date: '2026-07-01', hasSplitTransactions: true,
+          splitTransactions: [
+            { id: 's1', amount: -0.1, merchant: { id: 'm1', name: 'A' }, category: { id: 'c1', name: 'X' }, tags: [] },
+            { id: 's2', amount: -0.2, merchant: { id: 'm2', name: 'B' }, category: { id: 'c2', name: 'Y' }, tags: [] },
+          ],
+        },
       }
     );
 
@@ -287,27 +482,50 @@ describe('split_transaction tool', () => {
 
     // -0.1 + -0.2 === -0.30000000000000004 in floats; must still pass
     assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 3);
   });
 
-  it('clears splits with an empty array, skipping sum validation', async () => {
-    installMockFetch(calls, {
-      updateTransactionSplit: {
-        transaction: { id: 'txn-1', hasSplitTransactions: false, splitTransactions: [] },
-        errors: null,
+  it('clears splits with an empty array, skipping sum validation, and prunes mirror children', async () => {
+    // txn-001 is the fixture split parent whose child txn-005 is in the mirror.
+    installMockFetch(
+      calls,
+      {
+        updateTransactionSplit: {
+          transaction: { id: 'txn-001', hasSplitTransactions: false, splitTransactions: [] },
+          errors: null,
+        },
       },
-    });
+      {
+        getTransaction: {
+          id: 'txn-001', amount: -42.50, date: '2026-01-15',
+          hasSplitTransactions: false, splitTransactions: [],
+          merchant: { id: 'm-wf', name: 'Whole Foods' },
+          category: { id: 'cat-001', name: 'Groceries', group: { id: 'g1', name: 'Food & Dining', type: 'expense' } },
+          account: { id: 'acc-001', displayName: 'Checking (...1234)' },
+          tags: [],
+        },
+      }
+    );
+
+    assert.ok(mirrorRow('txn-005'), 'fixture child row exists before the un-split');
 
     const result = await client.callTool({
       name: 'split_transaction',
-      arguments: { transactionId: 'txn-1', splits: [] },
+      arguments: { transactionId: 'txn-001', splits: [] },
     });
 
     assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
-    assert.equal(calls.length, 1, 'should not need to fetch the parent');
+    assert.equal(calls.length, 2, 'no parent pre-fetch needed, just mutate + read back');
     assert.deepEqual(calls[0].body.variables, {
-      input: { transactionId: 'txn-1', splitData: [] },
+      input: { transactionId: 'txn-001', splitData: [] },
     });
+
+    const data = JSON.parse(result.content[0].text);
+    assert.deepEqual(data.verification, { verified: true });
+    assert.equal(data.mirror.synced, true);
+    assert.equal(data.mirror.prunedSplits, 1, 'stale child row is pruned');
+    assert.equal(mirrorRow('txn-005'), undefined, 'child gone from the mirror');
+    assert.equal(mirrorRow('txn-001').has_splits, 0);
   });
 
   it('surfaces API payload errors as tool errors', async () => {
@@ -389,36 +607,56 @@ describe('set_transaction_tags tool', () => {
   beforeEach(() => { calls = []; originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it('replaces the tag set and returns the transaction tags', async () => {
-    installMockFetch(calls, {
-      setTransactionTags: {
-        transaction: { id: 'txn-1', tags: [{ id: 'tag-1', name: 'Apple', color: '#f00', order: 1 }] },
-        errors: null,
+  it('replaces the tag set, verifies the read-back, and syncs tag names to the mirror', async () => {
+    installMockFetch(
+      calls,
+      {
+        setTransactionTags: {
+          transaction: { id: 'txn-002', tags: [{ id: 'tag-1', name: 'Apple', color: '#f00', order: 1 }] },
+          errors: null,
+        },
       },
-    });
+      {
+        getTransaction: {
+          id: 'txn-002', amount: -15.99, date: '2026-01-16',
+          merchant: { id: 'm-1', name: 'Netflix' },
+          category: { id: 'cat-002', name: 'Subscriptions', group: { id: 'g2', name: 'Bills', type: 'expense' } },
+          tags: [{ id: 'tag-1', name: 'Apple', color: '#f00', order: 1 }],
+          splitTransactions: [],
+        },
+      }
+    );
 
     const result = await client.callTool({
       name: 'set_transaction_tags',
-      arguments: { transactionId: 'txn-1', tagIds: ['tag-1'] },
+      arguments: { transactionId: 'txn-002', tagIds: ['tag-1'] },
     });
 
     assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    assert.equal(calls.length, 2, 'mutation then read-back');
     assert.match(calls[0].body.query, /Web_SetTransactionTags/);
     assert.deepEqual(calls[0].body.variables, {
-      input: { transactionId: 'txn-1', tagIds: ['tag-1'] },
+      input: { transactionId: 'txn-002', tagIds: ['tag-1'] },
     });
 
-    const txn = JSON.parse(result.content[0].text);
-    assert.equal(txn.tags[0].id, 'tag-1');
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.transaction.tags[0].id, 'tag-1');
+    assert.deepEqual(data.verification, { verified: true });
+    assert.equal(data.mirror.synced, true);
+    assert.equal(mirrorRow('txn-002').tags, 'Apple');
   });
 
   it('accepts an empty tagIds array to clear tags', async () => {
-    installMockFetch(calls, {
-      setTransactionTags: {
-        transaction: { id: 'txn-1', tags: [] },
-        errors: null,
+    installMockFetch(
+      calls,
+      {
+        setTransactionTags: {
+          transaction: { id: 'txn-1', tags: [] },
+          errors: null,
+        },
       },
-    });
+      { getTransaction: { id: 'txn-1', amount: -1, date: '2026-01-01', tags: [], splitTransactions: [] } }
+    );
 
     const result = await client.callTool({
       name: 'set_transaction_tags',
@@ -429,6 +667,33 @@ describe('set_transaction_tags tool', () => {
     assert.deepEqual(calls[0].body.variables, {
       input: { transactionId: 'txn-1', tagIds: [] },
     });
+    const data = JSON.parse(result.content[0].text);
+    assert.deepEqual(data.verification, { verified: true });
+  });
+
+  it('flags a mismatch when the live tags differ from the requested set', async () => {
+    installMockFetch(
+      calls,
+      {
+        setTransactionTags: {
+          transaction: { id: 'txn-1', tags: [] },
+          errors: null,
+        },
+      },
+      { getTransaction: { id: 'txn-1', amount: -1, date: '2026-01-01', tags: [], splitTransactions: [] } }
+    );
+
+    const result = await client.callTool({
+      name: 'set_transaction_tags',
+      arguments: { transactionId: 'txn-1', tagIds: ['tag-1'] },
+    });
+
+    assert.ok(!result.isError, 'a mismatch is a warning, not a tool error');
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.verification.verified, false);
+    assert.deepEqual(data.verification.mismatches, [
+      { field: 'tags', expected: ['tag-1'], actual: [] },
+    ]);
   });
 
   it('surfaces API payload errors as tool errors', async () => {

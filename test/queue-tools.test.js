@@ -1,6 +1,8 @@
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -8,11 +10,21 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { makeQueueDb, seed, extensionSplitRecord, seedExtensionSplitRecord } from './helpers/queue-seed.js';
 import { getRecord } from '../src/queue.js';
 
-// Point to fixture DB (mirror) and inject a fake token so loadToken()
-// never touches the real ~/.monarch-token.
+// queue_apply syncs the mirror after a successful apply, so point
+// MONARCH_DATA_DIR at a throwaway COPY of the fixture DB — never the
+// committed fixture itself. Also inject a fake token so loadToken() never
+// touches the real ~/.monarch-token.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-process.env.MONARCH_DATA_DIR = path.join(__dirname, 'fixtures');
+const tmpDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monarch-queue-tools-'));
+fs.copyFileSync(
+  path.join(__dirname, 'fixtures', 'monarch.db'),
+  path.join(tmpDataDir, 'monarch.db')
+);
+process.env.MONARCH_DATA_DIR = tmpDataDir;
 process.env.MONARCH_TOKEN = 'fake-test-token';
+process.on('exit', () => {
+  try { fs.rmSync(tmpDataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+});
 
 /** Spin up a linked client/server pair with an injected in-memory queue db. */
 async function createTestPair(queueDb) {
@@ -353,6 +365,17 @@ describe('queue_apply tool', () => {
             transaction: { id: 'txn-1', tags: [] },
             errors: null,
           },
+        },
+        // Post-apply mirror-sync read-back
+        {
+          getTransaction: {
+            id: 'txn-1', amount: -15.5, date: '2026-07-01', hasSplitTransactions: true,
+            tags: [{ id: 'tag-ext', name: 'Ext Processed', color: '#0f0', order: 2 }],
+            splitTransactions: [
+              { id: 's1', amount: -10.00, notes: 'first', merchant: { id: 'm1', name: 'Item A' }, category: { id: 'c1', name: 'Software' }, tags: [] },
+              { id: 's2', amount: -5.50, notes: null, merchant: { id: 'm2', name: 'Item B' }, category: { id: 'c2', name: 'Games' }, tags: [] },
+            ],
+          },
         }
       );
 
@@ -361,7 +384,9 @@ describe('queue_apply tool', () => {
       assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
       const data = parseResult(result);
       assert.equal(data.ok, true);
-      assert.equal(calls.length, 4);
+      assert.equal(calls.length, 5);
+      assert.match(calls[4].body.query, /GetTransactionDrawer/, 'post-apply read-back');
+      assert.equal(data.mirror.synced, true, 'live state synced into the mirror');
 
       // Split mutation strips extension-side split metadata (categorySource, ...)
       assert.match(calls[1].body.query, /Common_SplitTransactionMutation/);
@@ -518,13 +543,15 @@ describe('queue_apply tool', () => {
           { id: 'tag-a', name: 'Apple', color: '#f00', order: 1 },
           { id: 'tag-ext', name: 'Ext Processed', color: null, order: 2 },
         ] },
-        { setTransactionTags: { transaction: { id: 'txn-1', tags: [] }, errors: null } }
+        { setTransactionTags: { transaction: { id: 'txn-1', tags: [] }, errors: null } },
+        // Post-apply mirror-sync read-back
+        { getTransaction: { id: 'txn-1', amount: -15.5, date: '2026-07-01' } }
       );
 
       const result = await client.callTool({ name: 'queue_apply', arguments: { id: 'r1' } });
 
       assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
-      assert.equal(calls.length, 6);
+      assert.equal(calls.length, 7, 'apply mutations plus the post-apply read-back');
       assert.match(calls[3].body.query, /Common_CreateTransactionTag/);
       assert.equal(calls[3].body.variables.input.name, 'Ext Processed');
       assert.deepEqual(calls[5].body.variables.input.tagIds, ['tag-a', 'tag-ext']);

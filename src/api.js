@@ -88,18 +88,24 @@ function assertNoPayloadErrors(result, opName) {
 // ─── Queries (used to validate/confirm writes) ───────────────────────────
 
 /**
- * Fetch a single transaction (used to validate split sums against the
- * live parent amount, not the possibly-stale local mirror).
+ * Fetch a single transaction. Used to validate split sums against the live
+ * parent amount before splitting, and as the read-back after every write
+ * tool to verify the change and sync the local mirror — so the selection
+ * covers every field the mirror row needs (same fields as fetch.js).
  */
 export async function getTransaction(token, id) {
   const data = await graphqlRequest(token, `
     query GetTransactionDrawer($id: UUID!) {
       getTransaction(id: $id) {
         ${TRANSACTION_FIELDS}
+        originalDate isRecurring
+        category { id name group { id name type } }
+        originalTransaction { id }
         splitTransactions {
-          id amount notes
+          id amount notes hideFromReports
           merchant { id name }
-          category { id name }
+          category { id name group { id name type } }
+          tags { id name color order }
         }
       }
     }
