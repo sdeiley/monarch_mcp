@@ -15,16 +15,34 @@ import {
   openQueueDb, listRecords, getRecord, getStatsData,
   updateStatus, applyRecord, sweep, QUEUE_STATUSES,
 } from './queue.js';
+import {
+  syncTransactionToMirror, verifyTransactionUpdate,
+  verifyTransactionTags, verifyTransactionSplits,
+} from './mirror.js';
 
 export const SERVER_NAME = 'monarch-money';
-export const SERVER_VERSION = '0.4.0';
+export const SERVER_VERSION = '0.5.0';
 
 /**
- * Standard suffix for write tool descriptions.
+ * Standard suffix for write tool descriptions (rules/tags — writes whose
+ * effect on the mirror cannot be confirmed by re-fetching one transaction).
  */
 const WRITE_WARNING =
   ' WRITES TO THE LIVE MONARCH ACCOUNT — confirm with the user before calling. ' +
   'The local SQLite mirror becomes stale for affected transactions until refresh_transactions is run.';
+
+/**
+ * Suffix for transaction write tools that self-verify: after the mutation
+ * the tool re-fetches the transaction from the live API, verifies the
+ * requested changes took effect, and syncs the local mirror.
+ */
+const VERIFIED_WRITE_WARNING =
+  ' WRITES TO THE LIVE MONARCH ACCOUNT — confirm with the user before calling. ' +
+  'After the write, the tool re-fetches the transaction from the live API, verifies the change, ' +
+  'and syncs it into the local mirror. Check the result: if verification.verified is true and ' +
+  'mirror.synced is true, no refresh_transactions is needed; otherwise surface the ' +
+  'verification.warning/mismatches to the user, and treat the mirror as stale until ' +
+  'refresh_transactions is run.';
 
 /**
  * Wrap a write tool handler: loads the token, runs the mutation, and
@@ -72,8 +90,14 @@ export function createServer(options = {}) {
         '- To update the local mirror from the live API → use refresh_transactions tool\n\n' +
         'WRITE TOOLS (update_transaction, split_transaction, create_tag, set_transaction_tags, ' +
         'create_rule, update_rule, delete_rule) mutate the user\'s REAL Monarch account. ' +
-        'Confirm with the user before calling them. After a write, the local mirror is stale ' +
-        'for the affected transactions until refresh_transactions is run. ' +
+        'Confirm with the user before calling them. The transaction write tools ' +
+        '(update_transaction, split_transaction, set_transaction_tags) self-verify: after the ' +
+        'mutation they re-fetch the transaction from the live API, confirm the change took ' +
+        'effect, and sync the local mirror — check `verification` and `mirror` in the result; ' +
+        'when both succeed no refresh_transactions is needed, and when either fails the result ' +
+        'says so and the mirror is stale for that transaction until refresh_transactions is run. ' +
+        'Rule writes (especially applyToExistingTransactions) can change many transactions at ' +
+        'once and still require refresh_transactions to update the mirror. ' +
         'Transaction/category/tag IDs come from the local mirror (query_transactions and ' +
         'monarch:// resources); rule IDs come from list_rules.\n\n' +
         'RECOMMENDATION QUEUE (queue_list, queue_get, queue_update_status, queue_apply, ' +
@@ -350,7 +374,9 @@ function registerQueueTools(server, getQueueDb) {
         'the target transaction (refuses and marks the record stale if it already carries the ' +
         '"Ext Processed" tag or has splits), resolves any categoryName-only diff entries to ids ' +
         'via the local mirror, runs the proposed diff (split and/or update), sets ' +
-        'the "Ext Processed" tag, and marks the record applied by the agent. On mutation error ' +
+        'the "Ext Processed" tag, and marks the record applied by the agent. After a successful ' +
+        'apply the target transaction is re-fetched and synced into the local mirror (see ' +
+        '`mirror` in the result). On mutation error ' +
         'the record is marked failed (reset to pending via queue_update_status to retry). ' +
         'Use dry_run to see the preflight and mutation plan without writing.' +
         WRITE_WARNING,
@@ -362,7 +388,23 @@ function registerQueueTools(server, getQueueDb) {
     },
     queueHandler(async ({ id, dry_run }) => {
       const token = loadToken();
-      return applyRecord(getQueueDb(), token, { id, dryRun: dry_run });
+      const result = await applyRecord(getQueueDb(), token, { id, dryRun: dry_run });
+      // Best-effort mirror sync after a real apply: re-fetch the mutated
+      // transaction and upsert its live state so the mirror stays current.
+      if (result.ok && !dry_run && result.record?.target_txn_id) {
+        try {
+          const live = await api.getTransaction(token, result.record.target_txn_id);
+          result.mirror = live
+            ? syncTransactionToMirror(live)
+            : { synced: false, reason: 'transaction not found on read-back' };
+        } catch (err) {
+          result.mirror = {
+            synced: false,
+            reason: `read-back failed (${err.message}) — run refresh_transactions`,
+          };
+        }
+      }
+      return result;
     })
   );
 
@@ -401,14 +443,71 @@ function lookupMirrorTransactions(ids) {
 
 // ─── Write tools (live Monarch API mutations) ───────────────────────────
 
+/**
+ * Post-write confirmation: re-fetch the transaction from the live API,
+ * verify the requested changes took effect, and sync the live state into
+ * the local mirror.
+ *
+ * A read-back or sync failure is reported inside the result, never thrown —
+ * the remote mutation already succeeded and must not be masked as a failure.
+ *
+ * @param {string} token
+ * @param {string} transactionId
+ * @param {(live: object) => Array} verify - Returns mismatches for the live txn
+ * @param {object} mutationResult - Fallback transaction from the mutation payload
+ * @returns {Promise<{transaction: object, verification: object, mirror: object}>}
+ */
+async function confirmTransactionWrite(token, transactionId, verify, mutationResult) {
+  let live;
+  try {
+    live = await api.getTransaction(token, transactionId);
+  } catch (err) {
+    return {
+      transaction: mutationResult,
+      verification: {
+        verified: false,
+        warning: 'The write succeeded, but the confirmation read-back failed ' +
+          `(${err.message}). The local mirror was NOT updated — run refresh_transactions ` +
+          'before relying on it for this transaction.',
+      },
+      mirror: { synced: false, reason: 'read-back failed' },
+    };
+  }
+
+  if (!live) {
+    return {
+      transaction: mutationResult,
+      verification: {
+        verified: false,
+        warning: `The write succeeded, but transaction ${transactionId} was not found on ` +
+          'read-back. The local mirror was NOT updated — run refresh_transactions.',
+      },
+      mirror: { synced: false, reason: 'transaction not found on read-back' },
+    };
+  }
+
+  const mismatches = verify(live);
+  const verification = mismatches.length === 0
+    ? { verified: true }
+    : {
+        verified: false,
+        mismatches,
+        warning: 'The live transaction does not match the requested changes — a Monarch ' +
+          'rule or concurrent edit may have overridden them. The mirror was synced to the ' +
+          'LIVE state shown in `transaction`. Inform the user before retrying.',
+      };
+
+  return { transaction: live, verification, mirror: syncTransactionToMirror(live) };
+}
+
 function registerWriteTools(server) {
 
   server.registerTool(
     'update_transaction',
     {
       description: 'Update a Monarch transaction: set category, merchant name, notes, date, ' +
-        'hide-from-reports, or needs-review. Returns the updated transaction.' +
-        WRITE_WARNING,
+        'hide-from-reports, or needs-review. Returns { transaction, verification, mirror }.' +
+        VERIFIED_WRITE_WARNING,
       inputSchema: z.object({
         id: z.string().describe('Monarch transaction ID (UUID)'),
         categoryId: z.string().optional()
@@ -439,7 +538,10 @@ function registerWriteTools(server) {
         );
       }
 
-      return api.updateTransaction(token, input);
+      const mutated = await api.updateTransaction(token, input);
+      return confirmTransactionWrite(
+        token, id, live => verifyTransactionUpdate(input, live), mutated
+      );
     })
   );
 
@@ -450,8 +552,8 @@ function registerWriteTools(server) {
         'category, merchant name, and optional notes. Split amounts MUST sum exactly to the ' +
         'parent transaction amount (amounts are negative for expenses) — validated against the ' +
         'live parent amount before applying. Pass an empty splits array to remove all splits. ' +
-        'Returns the parent transaction with its splitTransactions.' +
-        WRITE_WARNING,
+        'Returns { transaction, verification, mirror } with the parent transaction and its splitTransactions.' +
+        VERIFIED_WRITE_WARNING,
       inputSchema: z.object({
         transactionId: z.string().describe('Parent Monarch transaction ID (UUID)'),
         splits: z.array(z.object({
@@ -482,7 +584,10 @@ function registerWriteTools(server) {
         }
       }
 
-      return api.splitTransaction(token, transactionId, splits);
+      const mutated = await api.splitTransaction(token, transactionId, splits);
+      return confirmTransactionWrite(
+        token, transactionId, live => verifyTransactionSplits(splits, live), mutated
+      );
     })
   );
 
@@ -506,8 +611,8 @@ function registerWriteTools(server) {
     {
       description: 'Replace the complete set of tags on a Monarch transaction. ' +
         'Pass ALL desired tag IDs — existing tags not included are removed; an empty array clears all tags. ' +
-        'Returns the transaction with its updated tags.' +
-        WRITE_WARNING,
+        'Returns { transaction, verification, mirror } with the updated tags.' +
+        VERIFIED_WRITE_WARNING,
       inputSchema: z.object({
         transactionId: z.string().describe('Monarch transaction ID (UUID)'),
         tagIds: z.array(z.string())
@@ -515,7 +620,10 @@ function registerWriteTools(server) {
       }),
     },
     writeHandler(async (token, { transactionId, tagIds }) => {
-      return api.setTransactionTags(token, transactionId, tagIds);
+      const mutated = await api.setTransactionTags(token, transactionId, tagIds);
+      return confirmTransactionWrite(
+        token, transactionId, live => verifyTransactionTags(tagIds, live), mutated
+      );
     })
   );
 

@@ -5,6 +5,7 @@
 
 import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
+import { UPSERT_TRANSACTION_SQL, transactionToRow } from './mirror.js';
 
 /**
  * Import transactions into a SQLite database.
@@ -67,50 +68,15 @@ export function importTransactions(data, dbPath) {
     );
   `);
 
-  const insert = db.prepare(`
-    INSERT OR REPLACE INTO transactions (
-      id, amount, date, original_date, plaid_name, notes,
-      pending, hide_from_reports, needs_review, is_recurring,
-      is_split, has_splits, parent_id,
-      merchant_id, merchant_name,
-      category_id, category_name, category_group, category_type,
-      account_id, account_name, tags
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  // Row mapping shared with the write-tool mirror sync (src/mirror.js).
+  const insert = db.prepare(UPSERT_TRANSACTION_SQL);
 
   let imported = 0;
 
   db.exec('BEGIN TRANSACTION');
 
   for (const t of transactions) {
-    const tags = t.tags?.length > 0
-      ? t.tags.map(tag => tag.name).join(',')
-      : null;
-
-    insert.run(
-      t.id,
-      t.amount,
-      t.date,
-      t.originalDate || null,
-      t.plaidName || null,
-      t.notes || null,
-      t.pending ? 1 : 0,
-      t.hideFromReports ? 1 : 0,
-      t.needsReview ? 1 : 0,
-      t.isRecurring ? 1 : 0,
-      t.isSplitTransaction ? 1 : 0,
-      t.hasSplitTransactions ? 1 : 0,
-      t.originalTransaction?.id || null,
-      t.merchant?.id || null,
-      t.merchant?.name || null,
-      t.category?.id || null,
-      t.category?.name || null,
-      t.category?.group?.name || null,
-      t.category?.group?.type || null,
-      t.account?.id || null,
-      t.account?.displayName || null,
-      tags,
-    );
+    insert.run(...transactionToRow(t));
     imported++;
   }
 
