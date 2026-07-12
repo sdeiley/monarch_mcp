@@ -12,16 +12,12 @@ import { loadToken } from './token.js';
 import { refreshDb } from './refresh.js';
 import * as api from './api.js';
 import {
-  openQueueDb, listRecords, getRecord, getStatsData,
-  updateStatus, applyRecord, sweep, QUEUE_STATUSES,
-} from './queue.js';
-import {
   syncTransactionToMirror, verifyTransactionUpdate,
   verifyTransactionTags, verifyTransactionSplits,
 } from './mirror.js';
 
 export const SERVER_NAME = 'monarch-money';
-export const SERVER_VERSION = '0.5.0';
+export const SERVER_VERSION = '0.6.0';
 
 /**
  * Standard suffix for write tool descriptions (rules/tags — writes whose
@@ -69,12 +65,9 @@ function writeHandler(fn) {
 /**
  * Create and configure the MCP server instance.
  * Resources and tools are registered here; transport is handled by the caller.
- * @param {{queueDb?: import('node:sqlite').DatabaseSync}} [options]
- *   queueDb: injectable queue database handle (tests pass ':memory:');
- *   defaults to lazily opening <dataDir>/queue.db on first queue tool use.
  * @returns {McpServer}
  */
-export function createServer(options = {}) {
+export function createServer() {
   const server = new McpServer(
     {
       name: SERVER_NAME,
@@ -100,14 +93,6 @@ export function createServer(options = {}) {
         'once and still require refresh_transactions to update the mirror. ' +
         'Transaction/category/tag IDs come from the local mirror (query_transactions and ' +
         'monarch:// resources); rule IDs come from list_rules.\n\n' +
-        'RECOMMENDATION QUEUE (queue_list, queue_get, queue_update_status, queue_apply, ' +
-        'queue_sweep; resource monarch://queue/stats): the browser extension pipeline captures ' +
-        'proposed transaction changes (splits, renames, categorizations) into a local queue.db. ' +
-        'Review workflow: queue_list with status=pending → present items to the user grouped by ' +
-        'group_key with confidence and reasoning → after the user approves, queue_apply each ' +
-        'approved id (dry_run=true first to preview) → queue_sweep for housekeeping. For queued ' +
-        'items always use queue_apply instead of the raw write tools — it preflights the live ' +
-        'transaction, sets the "Ext Processed" tag, and keeps queue status consistent.\n\n' +
         'The transactions table has columns: id, amount, date, merchant_name, plaid_name, ' +
         'category_name, category_group, category_type, account_name, notes, tags, ' +
         'is_split, parent_id, pending, is_recurring. ' +
@@ -115,33 +100,15 @@ export function createServer(options = {}) {
     }
   );
 
-  // Queue database: injected in tests, opened lazily (created on first
-  // access) in production so a missing queue.db never crashes the server.
-  let queueDb = options.queueDb ?? null;
-  const getQueueDb = () => (queueDb ??= openQueueDb());
-
-  registerResources(server, getQueueDb);
-  registerTools(server, getQueueDb);
+  registerResources(server);
+  registerTools(server);
 
   return server;
 }
 
 // ─── Resources ─────────────────────────────────────────────────────────
 
-function registerResources(server, getQueueDb) {
-
-  server.registerResource(
-    'queue-stats',
-    'monarch://queue/stats',
-    {
-      description: 'Recommendation queue stats: counts by status/type/merchant and lastGeneratedAt',
-      mimeType: 'application/json',
-    },
-    async (uri) => {
-      const stats = getStatsData(getQueueDb());
-      return { contents: [{ uri: uri.href, text: JSON.stringify(stats) }] };
-    }
-  );
+function registerResources(server) {
 
   server.registerResource(
     'schema',
@@ -221,7 +188,7 @@ function registerResources(server, getQueueDb) {
 
 // ─── Tools ──────────────────────────────────────────────────────────────
 
-function registerTools(server, getQueueDb) {
+function registerTools(server) {
 
   server.registerTool(
     'query_transactions',
@@ -277,168 +244,6 @@ function registerTools(server, getQueueDb) {
   );
 
   registerWriteTools(server);
-  registerQueueTools(server, getQueueDb);
-}
-
-// ─── Queue tools (recommendation queue, Track B3) ────────────────────────
-
-const EMPTY_QUEUE_MESSAGE =
-  'The recommendation queue is empty — no recommendations have been captured yet. ' +
-  'Records are produced by the browser extension pipeline (queue.db in the Monarch data directory).';
-
-/** Wrap a queue tool handler with uniform JSON/error formatting. */
-function queueHandler(fn) {
-  return async (args) => {
-    try {
-      const result = await fn(args);
-      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
-    } catch (err) {
-      return { isError: true, content: [{ type: 'text', text: err.message }] };
-    }
-  };
-}
-
-function registerQueueTools(server, getQueueDb) {
-
-  server.registerTool(
-    'queue_list',
-    {
-      description: 'List recommendation-queue records (extension-generated proposals to split, ' +
-        'rename, categorize, or tag Monarch transactions). Returns matching items plus overall ' +
-        'counts by status. Present pending items to the user grouped by group_key before applying.',
-      inputSchema: z.object({
-        status: z.enum(QUEUE_STATUSES).optional().describe('Filter by lifecycle status'),
-        type: z.string().optional().describe("Filter by record type, e.g. 'split', 'categorize', 'rename'"),
-        merchant: z.string().optional().describe("Filter by source merchant, e.g. 'apple'"),
-        min_confidence: z.number().min(0).max(1).optional().describe('Minimum confidence (0-1)'),
-        limit: z.number().int().positive().max(200).default(50),
-      }),
-    },
-    queueHandler(({ status, type, merchant, min_confidence, limit }) => {
-      const { items, counts } = listRecords(getQueueDb(), {
-        status, type, merchant, minConfidence: min_confidence, limit,
-      });
-      const result = { items, counts };
-      if (items.length === 0) {
-        result.message = Object.keys(counts).length === 0
-          ? EMPTY_QUEUE_MESSAGE
-          : 'No recommendations match the given filters.';
-      }
-      return result;
-    })
-  );
-
-  server.registerTool(
-    'queue_get',
-    {
-      description: 'Fetch a single recommendation-queue record by id, including its full payload ' +
-        '(source invoice data, captured target transaction, proposed diff, and reasoning).',
-      inputSchema: z.object({
-        id: z.string().describe('Recommendation id (from queue_list)'),
-      }),
-    },
-    queueHandler(({ id }) => {
-      const record = getRecord(getQueueDb(), id);
-      if (!record) {
-        throw new Error(`Recommendation '${id}' not found in the queue`);
-      }
-      return record;
-    })
-  );
-
-  server.registerTool(
-    'queue_update_status',
-    {
-      description: 'Transition a recommendation-queue record to a new lifecycle status as the ' +
-        "agent actor: dismiss a proposal ('dismissed') or reset a failed one for retry " +
-        "('pending'). Transitions the agent is not allowed to make (e.g. resurrecting an " +
-        'applied/dismissed record, or extension-only statuses) return an error. ' +
-        'To actually execute a recommendation, use queue_apply instead.',
-      inputSchema: z.object({
-        id: z.string().describe('Recommendation id (from queue_list)'),
-        status: z.enum(QUEUE_STATUSES).describe('Target status'),
-        note: z.string().optional()
-          .describe("Optional annotation recorded on the record (e.g. why it was dismissed)"),
-      }),
-    },
-    queueHandler(({ id, status, note }) => {
-      const record = updateStatus(getQueueDb(), id, status, 'agent', { error: note });
-      return { ok: true, record };
-    })
-  );
-
-  server.registerTool(
-    'queue_apply',
-    {
-      description: 'Execute a queued recommendation against the live Monarch account: preflights ' +
-        'the target transaction (refuses and marks the record stale if it already carries the ' +
-        '"Ext Processed" tag or has splits), resolves any categoryName-only diff entries to ids ' +
-        'via the local mirror, runs the proposed diff (split and/or update), sets ' +
-        'the "Ext Processed" tag, and marks the record applied by the agent. After a successful ' +
-        'apply the target transaction is re-fetched and synced into the local mirror (see ' +
-        '`mirror` in the result). On mutation error ' +
-        'the record is marked failed (reset to pending via queue_update_status to retry). ' +
-        'Use dry_run to see the preflight and mutation plan without writing.' +
-        WRITE_WARNING,
-      inputSchema: z.object({
-        id: z.string().describe('Recommendation id (from queue_list)'),
-        dry_run: z.boolean().default(false)
-          .describe('Preflight and plan only — no mutations, no status change'),
-      }),
-    },
-    queueHandler(async ({ id, dry_run }) => {
-      const token = loadToken();
-      const result = await applyRecord(getQueueDb(), token, { id, dryRun: dry_run });
-      // Best-effort mirror sync after a real apply: re-fetch the mutated
-      // transaction and upsert its live state so the mirror stays current.
-      if (result.ok && !dry_run && result.record?.target_txn_id) {
-        try {
-          const live = await api.getTransaction(token, result.record.target_txn_id);
-          result.mirror = live
-            ? syncTransactionToMirror(live)
-            : { synced: false, reason: 'transaction not found on read-back' };
-        } catch (err) {
-          result.mirror = {
-            synced: false,
-            reason: `read-back failed (${err.message}) — run refresh_transactions`,
-          };
-        }
-      }
-      return result;
-    })
-  );
-
-  server.registerTool(
-    'queue_sweep',
-    {
-      description: 'Housekeep the recommendation queue: mark active records stale when their ' +
-        'target transaction in the local monarch.db mirror is missing, already tagged ' +
-        '"Ext Processed", already split, or recategorized; then purge old terminal records ' +
-        '(applied 7d, dismissed 30d, stale 7d, failed 14d; 500-record soft cap). ' +
-        'Only touches the local queue database, never the live Monarch account. ' +
-        'Run refresh_transactions first for an up-to-date staleness check.',
-      inputSchema: z.object({}),
-    },
-    queueHandler(() => {
-      return sweep(getQueueDb(), { lookupMirrorTxns: lookupMirrorTransactions });
-    })
-  );
-}
-
-/**
- * Default mirror lookup for queue_sweep: fetch target transactions from the
- * local monarch.db mirror. Ids are quoted (not interpolated raw) because
- * queryDb only accepts a SQL string.
- * @param {string[]} ids
- * @returns {Map<string, object>}
- */
-function lookupMirrorTransactions(ids) {
-  if (ids.length === 0) return new Map();
-  const quoted = ids.map(id => `'${String(id).replace(/'/g, "''")}'`).join(', ');
-  const rows = queryDb(
-    `SELECT id, category_id, has_splits, tags FROM transactions WHERE id IN (${quoted})`
-  );
-  return new Map(rows.map(r => [r.id, r]));
 }
 
 // ─── Write tools (live Monarch API mutations) ───────────────────────────

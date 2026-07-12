@@ -42,6 +42,14 @@ describe('MCP Tools registration', () => {
       assert.ok(tool.inputSchema, `${tool.name} should have an inputSchema`);
     }
   });
+
+  it('does not register queue tools (moved to the extension repo\'s queue MCP)', async () => {
+    const result = await client.listTools();
+    const names = result.tools.map(t => t.name);
+    for (const name of names) {
+      assert.ok(!name.startsWith('queue_'), `${name} must not be registered here`);
+    }
+  });
 });
 
 describe('query_transactions tool', () => {
