@@ -23,7 +23,7 @@ describe('MCP Server module', () => {
   it('server has the expected name and version', async () => {
     const { SERVER_NAME, SERVER_VERSION } = await import('../src/server.js');
     assert.equal(SERVER_NAME, 'monarch-money');
-    assert.equal(SERVER_VERSION, '0.6.0');
+    assert.equal(SERVER_VERSION, '0.6.1');
   });
 });
 

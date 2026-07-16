@@ -338,13 +338,46 @@ describe('Monarch API write client', () => {
     it('deleteRule sends Common_DeleteTransactionRule with the rule id', async () => {
       mockFetch({ deleteTransactionRule: { deleted: true, errors: null } });
 
-      const deleted = await api.deleteRule(FAKE_TOKEN, 'r1');
+      const result = await api.deleteRule(FAKE_TOKEN, 'r1');
 
       const { body } = lastCall();
       assert.match(body.query, /mutation Common_DeleteTransactionRule\(\$id: ID!\)/);
       assert.match(body.query, /deleteTransactionRule\(id: \$id\)/);
       assert.deepEqual(body.variables, { id: 'r1' });
-      assert.equal(deleted, true);
+      assert.deepEqual(result, { deleted: true, apiDeletedField: true });
+    });
+
+    // Regression: the live API returns deleted:false (or null) even for
+    // SUCCESSFUL deletes (verified 2026-07-15, 50/50 deletions). Success is
+    // the absence of payload errors, never the `deleted` field.
+    it('deleteRule reports success despite the API\'s unreliable deleted:false', async () => {
+      mockFetch({ deleteTransactionRule: { deleted: false, errors: null } });
+
+      const result = await api.deleteRule(FAKE_TOKEN, 'r1');
+
+      assert.deepEqual(result, { deleted: true, apiDeletedField: false });
+    });
+
+    it('deleteRule reports success when the deleted field is null', async () => {
+      mockFetch({ deleteTransactionRule: { deleted: null, errors: null } });
+
+      const result = await api.deleteRule(FAKE_TOKEN, 'r1');
+
+      assert.deepEqual(result, { deleted: true, apiDeletedField: null });
+    });
+
+    it('deleteRule throws on payload errors and never reports deleted:true', async () => {
+      mockFetch({
+        deleteTransactionRule: {
+          deleted: false,
+          errors: [{ message: 'Rule not found', code: 'not_found', fieldErrors: null }],
+        },
+      });
+
+      await assert.rejects(
+        () => api.deleteRule(FAKE_TOKEN, 'r-bogus'),
+        /deleteRule failed: Rule not found/
+      );
     });
   });
 });

@@ -799,17 +799,141 @@ describe('rule tools', () => {
     assert.match(result.content[0].text, /Invalid split configuration/);
   });
 
-  it('update_rule sends the rule id with updated fields', async () => {
-    installMockFetch(calls, { updateTransactionRuleV2: { errors: null } });
+  // A rule as getRules returns it: action fields are OBJECTS on read but
+  // must be written back as bare strings (category ID, merchant NAME, tag IDs).
+  const CURRENT_RULE = {
+    id: 'r1',
+    order: 0,
+    merchantCriteriaUseOriginalStatement: null,
+    merchantCriteria: null,
+    merchantNameCriteria: [{ operator: 'eq', value: 'Old Merchant' }],
+    originalStatementCriteria: null,
+    amountCriteria: { operator: 'eq', isExpense: true, value: 9.99, valueRange: null },
+    categoryIds: null,
+    accountIds: ['acc-1'],
+    categories: [],
+    setCategoryAction: { id: 'cat-1', name: 'Software' },
+    setMerchantAction: { id: 'm-77', name: 'Apple' },
+    addTagsAction: [{ id: 'tag-1', name: 'Apple', color: '#f00' }],
+    reviewStatusAction: null,
+    setHideFromReportsAction: false,
+    splitTransactionsAction: null,
+    recentApplicationCount: 3,
+    lastAppliedAt: '2026-07-01T00:00:00Z',
+  };
+
+  // Regression (2026-07-15): the live update mutation silently ignores
+  // partial inputs while reporting success. update_rule must fetch the
+  // current rule, merge the caller's fields over it, and send the COMPLETE
+  // input with read-shapes converted to write-shapes.
+  it('update_rule merges partial input over the full current rule with read→write conversion', async () => {
+    installMockFetch(
+      calls,
+      { transactionRules: [CURRENT_RULE] },
+      { updateTransactionRuleV2: { errors: null } }
+    );
 
     const result = await client.callTool({
       name: 'update_rule',
-      arguments: { id: 'r1', setCategoryAction: 'cat-2' },
+      arguments: {
+        id: 'r1',
+        merchantNameCriteria: [{ operator: 'eq', value: 'New Merchant' }],
+        applyToExistingTransactions: true,
+      },
     });
 
     assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
-    assert.match(calls[0].body.query, /Common_UpdateTransactionRuleMutationV2/);
-    assert.deepEqual(calls[0].body.variables.input, { id: 'r1', setCategoryAction: 'cat-2' });
+    assert.equal(calls.length, 2, 'fetch rules, then update');
+    assert.match(calls[0].body.query, /transactionRules/);
+    assert.match(calls[1].body.query, /Common_UpdateTransactionRuleMutationV2/);
+    assert.deepEqual(calls[1].body.variables.input, {
+      id: 'r1',
+      // Caller's fields
+      merchantNameCriteria: [{ operator: 'eq', value: 'New Merchant' }],
+      applyToExistingTransactions: true,
+      // Preserved from the current rule, converted to write shape
+      amountCriteria: { operator: 'eq', isExpense: true, value: 9.99, valueRange: null },
+      accountIds: ['acc-1'],
+      setCategoryAction: 'cat-1',      // { id, name } → ID string
+      setMerchantAction: 'Apple',      // { id, name } → NAME string
+      addTagsAction: ['tag-1'],        // tag objects → ID strings
+      setHideFromReportsAction: false, // falsy but meaningful — must survive
+    });
+
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.updated, true);
+    assert.equal(data.input.setMerchantAction, 'Apple', 'result echoes the merged input');
+  });
+
+  it('update_rule lets caller fields override the preserved state', async () => {
+    installMockFetch(
+      calls,
+      { transactionRules: [CURRENT_RULE] },
+      { updateTransactionRuleV2: { errors: null } }
+    );
+
+    const result = await client.callTool({
+      name: 'update_rule',
+      arguments: { id: 'r1', setCategoryAction: 'cat-2', addTagsAction: [] },
+    });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    const input = calls[1].body.variables.input;
+    assert.equal(input.setCategoryAction, 'cat-2', 'override wins over current cat-1');
+    assert.deepEqual(input.addTagsAction, [], 'explicit empty array clears the action');
+    assert.equal(input.setMerchantAction, 'Apple', 'untouched action is preserved');
+    assert.deepEqual(input.merchantNameCriteria, [{ operator: 'eq', value: 'Old Merchant' }],
+      'untouched criteria are preserved');
+  });
+
+  it('update_rule preserves legacy merchantCriteria unless new criteria replace it', async () => {
+    const legacyRule = {
+      ...CURRENT_RULE,
+      id: 'r2',
+      merchantCriteria: [{ operator: 'contains', value: 'AMZN' }],
+      merchantCriteriaUseOriginalStatement: true,
+      merchantNameCriteria: null,
+    };
+    installMockFetch(
+      calls,
+      { transactionRules: [legacyRule] },
+      { updateTransactionRuleV2: { errors: null } },
+      { transactionRules: [legacyRule] },
+      { updateTransactionRuleV2: { errors: null } }
+    );
+
+    // Untouched criteria: the legacy representation must round-trip.
+    await client.callTool({
+      name: 'update_rule',
+      arguments: { id: 'r2', setCategoryAction: 'cat-9' },
+    });
+    let input = calls[1].body.variables.input;
+    assert.deepEqual(input.merchantCriteria, [{ operator: 'contains', value: 'AMZN' }]);
+    assert.equal(input.merchantCriteriaUseOriginalStatement, true);
+
+    // Providing new-style criteria supersedes the legacy representation.
+    await client.callTool({
+      name: 'update_rule',
+      arguments: { id: 'r2', merchantNameCriteria: [{ operator: 'eq', value: 'Amazon' }] },
+    });
+    input = calls[3].body.variables.input;
+    assert.equal(input.merchantCriteria, undefined, 'legacy criteria dropped');
+    assert.equal(input.merchantCriteriaUseOriginalStatement, undefined);
+    assert.deepEqual(input.merchantNameCriteria, [{ operator: 'eq', value: 'Amazon' }]);
+  });
+
+  it('update_rule errors on an unknown rule ID without calling the mutation', async () => {
+    installMockFetch(calls, { transactionRules: [CURRENT_RULE] });
+
+    const result = await client.callTool({
+      name: 'update_rule',
+      arguments: { id: 'r-bogus', setCategoryAction: 'cat-2' },
+    });
+
+    assert.ok(result.isError, 'should be an error');
+    assert.match(result.content[0].text, /r-bogus not found/);
+    assert.match(result.content[0].text, /list_rules/);
+    assert.equal(calls.length, 1, 'only the rules fetch — no mutation');
   });
 
   it('delete_rule deletes by id and reports deletion', async () => {
@@ -825,5 +949,38 @@ describe('rule tools', () => {
     assert.deepEqual(calls[0].body.variables, { id: 'r1' });
     const data = JSON.parse(result.content[0].text);
     assert.equal(data.deleted, true);
+  });
+
+  // Regression (2026-07-15): Monarch returns deleted:false for SUCCESSFUL
+  // deletes. The tool must report success when there are no payload errors.
+  it('delete_rule reports success even when the API says deleted:false', async () => {
+    installMockFetch(calls, { deleteTransactionRule: { deleted: false, errors: null } });
+
+    const result = await client.callTool({
+      name: 'delete_rule',
+      arguments: { id: 'r1' },
+    });
+
+    assert.ok(!result.isError, `should not error: ${result.content?.[0]?.text}`);
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.deleted, true, 'success is the absence of payload errors');
+    assert.equal(data.apiDeletedField, false, 'raw unreliable field kept for debugging');
+  });
+
+  it('delete_rule surfaces payload errors as tool errors, never as deleted:true', async () => {
+    installMockFetch(calls, {
+      deleteTransactionRule: {
+        deleted: false,
+        errors: [{ message: 'Rule not found', code: 'not_found', fieldErrors: null }],
+      },
+    });
+
+    const result = await client.callTool({
+      name: 'delete_rule',
+      arguments: { id: 'r-bogus' },
+    });
+
+    assert.ok(result.isError, 'should be an error');
+    assert.match(result.content[0].text, /Rule not found/);
   });
 });

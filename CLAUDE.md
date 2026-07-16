@@ -19,7 +19,7 @@ src/
     stdio.js       # stdio transport entry point
     cli.js         # CLI: init, refresh, serve
 test/
-  *.test.js        # node:test suite (127 tests)
+  *.test.js        # node:test suite (135 tests)
   fixtures/
     monarch.db     # Committed 5-row fixture DB
     create-fixture-db.js  # Regenerates the fixture
@@ -35,7 +35,7 @@ test/
 ## Running Tests
 
 ```bash
-npm test                          # All 127 tests
+npm test                          # All 135 tests
 node --test test/db.test.js       # Single file
 ```
 
@@ -84,5 +84,7 @@ exercise writes must point `MONARCH_DATA_DIR` at a temp COPY of the fixture DB, 
 committed fixture.
 
 Write-tool conventions (`src/api.js`): endpoint `https://api.monarch.com/graphql`, header `Authorization: Token <token>` (not Bearer) + `Client-Platform: web`. Payload-level `errors` arrays are surfaced as thrown errors. Never log or echo the token.
+
+Rule API quirks (both verified live 2026-07-15): (1) `deleteTransactionRule` returns `deleted: false` even on successful deletes — `deleteRule` treats the absence of payload errors as success and only echoes the raw field as `apiDeletedField`. (2) `updateTransactionRuleV2` silently ignores partial inputs while reporting success — `update_rule` therefore does fetch-merge-write: it loads the rule via `getRules`, merges the caller's fields over the full current state, converts read shapes to write shapes (`setCategoryAction` object → category ID, `setMerchantAction` object → merchant NAME, `addTagsAction` objects → tag IDs), and sends the complete input. Fields outside the `getRules` selection (goal-link, business-entity, notification, needs-review-by-user actions) are not round-tripped.
 
 The recommendation queue (queue.db + `queue_*` tools) moved out of this server in v0.6.0: it is extension-specific and now lives in the monarch_chrome_extension repo's `mcp-queue/` server, alongside its producer.

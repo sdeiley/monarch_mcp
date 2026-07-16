@@ -296,9 +296,18 @@ export async function updateRule(token, input) {
 
 /**
  * Delete a transaction rule.
+ *
+ * Monarch's `deleted` response field is UNRELIABLE: it comes back false (or
+ * null) even when the rule was actually deleted (verified live 2026-07-15 —
+ * 50 successful deletes, every one reporting `deleted: false` while the rules
+ * disappeared from the rules list). Payload `errors` are the real failure
+ * signal: assertNoPayloadErrors throws on genuine failures, so once it passes
+ * the delete succeeded. The raw field is passed through as `apiDeletedField`
+ * for debugging only — do not branch on it.
+ *
  * @param {string} token
  * @param {string} id - Rule ID
- * @returns {Promise<boolean>} Whether the rule was deleted
+ * @returns {Promise<{deleted: true, apiDeletedField: boolean|null}>}
  */
 export async function deleteRule(token, id) {
   const data = await graphqlRequest(token, `
@@ -312,5 +321,5 @@ export async function deleteRule(token, id) {
 
   const result = data.deleteTransactionRule;
   assertNoPayloadErrors(result, 'deleteRule');
-  return result.deleted;
+  return { deleted: true, apiDeletedField: result.deleted ?? null };
 }

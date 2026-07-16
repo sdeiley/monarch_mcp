@@ -13,7 +13,7 @@ Most Monarch Money MCP servers are **API passthroughs** — each tool call hits 
 - **MCP Resources** — the only Monarch MCP that exposes schema, accounts, categories, and tags as MCP resources. This gives AI clients the metadata they need to write good queries without burning tool calls.
 - **Token-efficient** — pre-computed resources and SQL-level filtering mean only relevant data crosses the wire. Other servers return full API payloads on every call.
 - **Zero native dependencies** — uses Node.js built-in `node:sqlite`, no compiled extensions. Just `npm install` and go.
-- **127 tests** — fixture-based test suite with no dependency on real financial data; write tools are tested against a mocked API.
+- **135 tests** — fixture-based test suite with no dependency on real financial data; write tools are tested against a mocked API.
 - **Write tools** — update, split, and tag transactions, and manage auto-categorization rules, directly against the live Monarch API. Designed for the "extension/mirror as read-only sensor, agent as sole writer" architecture.
 
 **Trade-off:** This server focuses on transactions (SQL analysis + write operations). For budgets, investments, or cashflow, pair it with an API-passthrough MCP like [robcerda/monarch-mcp-server](https://github.com/robcerda/monarch-mcp-server).
@@ -106,7 +106,7 @@ The server exposes 4 read-only resources:
 | `set_transaction_tags` | Replace the full tag set on a transaction (write) |
 | `list_rules` | List all transaction rules with criteria/actions (live API read) |
 | `create_rule` | Create an auto-categorization rule (criteria + actions) (write) |
-| `update_rule` | Update an existing rule by ID (write) |
+| `update_rule` | Update an existing rule by ID; supports partial updates via fetch-merge-write (write) |
 | `delete_rule` | Delete a rule by ID (write) |
 
 ### Write tools
@@ -120,6 +120,8 @@ Notes:
 - `split_transaction` validates that split amounts sum exactly to the live parent transaction amount (to the cent) before calling the API. Amounts are negative for expenses.
 - `set_transaction_tags` replaces the complete tag set; include existing tag IDs you want to keep.
 - Rule create/update mutations return no rule entity (Monarch API limitation); use `list_rules` to confirm.
+- `update_rule` genuinely supports partial updates: the Monarch update mutation silently ignores partial inputs (while reporting success), so the tool fetches the rule's current state, merges your fields over it, converts read shapes to write shapes (category/tag objects → IDs, merchant object → name), and sends the complete input. Goal-link, business-entity, notification, and needs-review-by-user actions are not round-tripped and may be reset by an update.
+- `delete_rule` treats the absence of API errors as success: Monarch's `deleted` response field is unreliable (it reports `false` even for successful deletes) and is echoed only as `apiDeletedField` for debugging.
 
 ### Transaction Table Columns
 

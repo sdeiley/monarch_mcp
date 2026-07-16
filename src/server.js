@@ -17,7 +17,7 @@ import {
 } from './mirror.js';
 
 export const SERVER_NAME = 'monarch-money';
-export const SERVER_VERSION = '0.6.0';
+export const SERVER_VERSION = '0.6.1';
 
 /**
  * Standard suffix for write tool descriptions (rules/tags — writes whose
@@ -501,6 +501,55 @@ function pickRuleInput(args) {
   return input;
 }
 
+/**
+ * Convert a rule as read from getRules (read shape) into the write shape
+ * accepted by UpdateTransactionRuleInput, so the caller's partial update can
+ * be merged over the rule's full current state. The Monarch update mutation
+ * silently ignores partial inputs (verified live 2026-07-15: an input with
+ * only criteria + applyToExistingTransactions returned success but changed
+ * nothing), so every update must resend the complete rule.
+ *
+ * Read → write conversions (per docs/api-reference.md, HAR-validated):
+ * - setCategoryAction  { id, name }        → category ID string
+ * - setMerchantAction  { id, name }        → merchant NAME string (the API
+ *   creates a new merchant for unknown names, so reuse the name exactly)
+ * - addTagsAction      [{ id, name, ... }] → [tag ID strings]
+ * - criteria fields (merchantNameCriteria, originalStatementCriteria,
+ *   amountCriteria, categoryIds, accountIds, legacy merchantCriteria +
+ *   merchantCriteriaUseOriginalStatement) read and write in the same shape.
+ * - splitTransactionsAction's read selection matches its write shape.
+ *
+ * NOT round-tripped (not in the getRules selection; write shape unverified):
+ * goal-link, business-entity, notification, and needs-review-by-user actions.
+ */
+function ruleToWriteInput(rule) {
+  const input = {};
+  const copy = (key, value) => {
+    if (value !== null && value !== undefined) input[key] = value;
+  };
+
+  // Criteria — read shape === write shape.
+  copy('merchantCriteria', rule.merchantCriteria);
+  copy('merchantCriteriaUseOriginalStatement', rule.merchantCriteriaUseOriginalStatement);
+  copy('merchantNameCriteria', rule.merchantNameCriteria);
+  copy('originalStatementCriteria', rule.originalStatementCriteria);
+  copy('amountCriteria', rule.amountCriteria);
+  copy('categoryIds', rule.categoryIds);
+  copy('accountIds', rule.accountIds);
+
+  // Actions — objects read back must be written as bare strings.
+  copy('setCategoryAction', rule.setCategoryAction?.id);
+  copy('setMerchantAction', rule.setMerchantAction?.name);
+  if (rule.addTagsAction != null) {
+    input.addTagsAction = rule.addTagsAction.map(t => t.id);
+  }
+  copy('reviewStatusAction', rule.reviewStatusAction);
+  copy('setHideFromReportsAction', rule.setHideFromReportsAction);
+  copy('splitTransactionsAction', rule.splitTransactionsAction);
+
+  return input;
+}
+
 function registerRuleTools(server) {
 
   server.registerTool(
@@ -546,10 +595,17 @@ function registerRuleTools(server) {
   server.registerTool(
     'update_rule',
     {
-      description: 'Update an existing Monarch transaction rule by ID. Provide the fields to ' +
-        'change (same shape as create_rule). Note: action fields read as objects via list_rules ' +
-        'but are written as bare ID strings here. The API returns no rule entity on success — ' +
-        'call list_rules to confirm.' +
+      description: 'Update an existing Monarch transaction rule by ID. Provide only the fields ' +
+        'to change (same shape as create_rule): the tool fetches the rule\'s current state, ' +
+        'merges your fields over it, and writes the complete input — required because the ' +
+        'Monarch API silently ignores partial inputs while reporting success. Errors if the ' +
+        'rule ID does not exist. Provided fields REPLACE the current value wholesale (e.g. ' +
+        'addTagsAction replaces the full tag-action list); providing merchantNameCriteria or ' +
+        'originalStatementCriteria also replaces any legacy merchantCriteria on the rule. ' +
+        'Not preserved across updates (rare; not returned by list_rules): goal-link, ' +
+        'business-entity, notification, and needs-review-by-user actions. The API returns no ' +
+        'rule entity on success — the result echoes the merged input actually sent; call ' +
+        'list_rules to confirm.' +
         WRITE_WARNING,
       inputSchema: z.object({
         id: z.string().describe('Rule ID (from list_rules)'),
@@ -557,22 +613,47 @@ function registerRuleTools(server) {
       }),
     },
     writeHandler(async (token, args) => {
-      const input = { id: args.id, ...pickRuleInput(args) };
-      return api.updateRule(token, input);
+      // Fetch-merge-write: the update mutation silently no-ops on partial
+      // input, so merge the caller's fields over the rule's current state
+      // and always send the complete rule.
+      const rules = await api.getRules(token);
+      const current = rules.find(r => r.id === args.id);
+      if (!current) {
+        throw new Error(
+          `Rule ${args.id} not found. Call list_rules to get valid rule IDs.`
+        );
+      }
+
+      const base = ruleToWriteInput(current);
+      const overrides = pickRuleInput(args);
+      // New-style merchant/statement criteria supersede the legacy
+      // representation — keeping both would AND the two criteria sets.
+      if (overrides.merchantNameCriteria !== undefined ||
+          overrides.originalStatementCriteria !== undefined) {
+        delete base.merchantCriteria;
+        delete base.merchantCriteriaUseOriginalStatement;
+      }
+
+      const input = { ...base, ...overrides, id: args.id };
+      const result = await api.updateRule(token, input);
+      return { ...result, input };
     })
   );
 
   server.registerTool(
     'delete_rule',
     {
-      description: 'Delete a Monarch transaction rule by ID.' + WRITE_WARNING,
+      description: 'Delete a Monarch transaction rule by ID. Success is determined by the ' +
+        'absence of API errors: Monarch\'s own `deleted` response field is unreliable (it ' +
+        'reports false even for successful deletes) and is echoed as apiDeletedField for ' +
+        'debugging only — trust `deleted` in the result, not apiDeletedField.' +
+        WRITE_WARNING,
       inputSchema: z.object({
         id: z.string().describe('Rule ID (from list_rules)'),
       }),
     },
     writeHandler(async (token, { id }) => {
-      const deleted = await api.deleteRule(token, id);
-      return { deleted };
+      return api.deleteRule(token, id);
     })
   );
 }
