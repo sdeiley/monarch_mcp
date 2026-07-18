@@ -252,6 +252,120 @@ export async function createTag(token, name, color) {
   return tags.find(t => t.name === name) || { name, color };
 }
 
+// ─── Budget (operations extracted from the Monarch web app bundle,
+//     read path verified live 2026-07-18) ────────────────────────────────
+
+const BUDGET_MONTHLY_AMOUNTS_FIELDS = `
+  month plannedCashFlowAmount plannedSetAsideAmount actualAmount
+  remainingAmount previousMonthRolloverAmount rolloverType
+  cumulativeActualAmount rolloverTargetAmount
+`;
+
+const BUDGET_DATA_QUERY = `
+query Common_BudgetDataQuery($startDate: Date!, $endDate: Date!) {
+  budgetSystem
+  budgetStatus { hasBudget hasTransactions }
+  budgetData(startMonth: $startDate, endMonth: $endDate) {
+    monthlyAmountsByCategory {
+      category { id }
+      monthlyAmounts { ${BUDGET_MONTHLY_AMOUNTS_FIELDS} }
+    }
+    monthlyAmountsByCategoryGroup {
+      categoryGroup { id }
+      monthlyAmounts { ${BUDGET_MONTHLY_AMOUNTS_FIELDS} }
+    }
+    monthlyAmountsForFlexExpense {
+      budgetVariability
+      monthlyAmounts { ${BUDGET_MONTHLY_AMOUNTS_FIELDS} }
+    }
+    totalsByMonth {
+      month
+      totalIncome { ...BudgetTotalsFields }
+      totalExpenses { ...BudgetTotalsFields }
+      totalFixedExpenses { ...BudgetTotalsFields }
+      totalNonMonthlyExpenses { ...BudgetTotalsFields }
+      totalFlexibleExpenses { ...BudgetTotalsFields }
+    }
+  }
+  categoryGroups {
+    id name order type budgetVariability groupLevelBudgetingEnabled
+    categories {
+      id name order budgetVariability excludeFromBudget isSystemCategory
+      rolloverPeriod { id startMonth endMonth startingBalance targetAmount frequency type }
+    }
+    rolloverPeriod { id type startMonth endMonth startingBalance frequency targetAmount }
+  }
+  goalsV2 {
+    id name archivedAt completedAt priority
+    plannedContributions(startMonth: $startDate, endMonth: $endDate) { id month amount }
+    monthlyContributionSummaries(startMonth: $startDate, endMonth: $endDate) { month sum }
+  }
+}
+fragment BudgetTotalsFields on BudgetTotals {
+  actualAmount plannedAmount previousMonthRolloverAmount remainingAmount
+}
+`;
+
+/**
+ * Fetch budget data for a month range. Months are the first-of-month in
+ * YYYY-MM-DD form (e.g. "2026-07-01").
+ * @returns {Promise<object>} { budgetSystem, budgetStatus, budgetData,
+ *   categoryGroups, goalsV2 }
+ */
+export async function getBudgetData(token, startMonth, endMonth) {
+  return graphqlRequest(token, BUDGET_DATA_QUERY, {
+    startDate: startMonth,
+    endDate: endMonth,
+  });
+}
+
+/** Fetch household budget settings. */
+export async function getBudgetSettings(token) {
+  return graphqlRequest(token, `{
+    budgetSystem
+    budgetApplyToFutureMonthsDefault
+    flexExpenseRolloverPeriod { id startMonth startingBalance }
+  }`);
+}
+
+/**
+ * Set the planned budget amount for a category or category group.
+ * @param {string} token
+ * @param {object} input - UpdateOrCreateBudgetItemMutationInput:
+ *   `startDate` (first of month, YYYY-MM-DD), `timeframe` ("month"),
+ *   `amount`, `applyToFuture`, and exactly one of `categoryId` /
+ *   `categoryGroupId`.
+ * @returns {Promise<object>} The budget item ({ id, plannedCashFlowAmount })
+ */
+export async function updateBudgetItem(token, input) {
+  const data = await graphqlRequest(token, `
+    mutation Common_UpdateBudgetItem($input: UpdateOrCreateBudgetItemMutationInput!) {
+      updateOrCreateBudgetItem(input: $input) {
+        budgetItem { id plannedCashFlowAmount }
+      }
+    }
+  `, { input });
+  return data.updateOrCreateBudgetItem?.budgetItem ?? null;
+}
+
+/**
+ * Set the planned flex-expense budget amount (fixed_and_flex budget system).
+ * @param {string} token
+ * @param {object} input - UpdateOrCreateFlexBudgetItemMutationInput:
+ *   `startDate` (first of month), `amount`, `applyToFuture`.
+ * @returns {Promise<object>} The budget item ({ id, budgetAmount })
+ */
+export async function updateFlexBudgetItem(token, input) {
+  const data = await graphqlRequest(token, `
+    mutation Common_UpdateFlexBudgetMutation($input: UpdateOrCreateFlexBudgetItemMutationInput!) {
+      updateOrCreateFlexBudgetItem(input: $input) {
+        budgetItem { id budgetAmount }
+      }
+    }
+  `, { input });
+  return data.updateOrCreateFlexBudgetItem?.budgetItem ?? null;
+}
+
 // ─── Rule mutations (TransactionRuleV2, HAR-validated) ───────────────────
 
 /**

@@ -14,12 +14,12 @@ src/
   refresh.js       # Async orchestrator: fetch → import
   api.js           # Monarch GraphQL write client (mutations + live reads)
   mirror.js        # Post-write read-back verification + local-mirror sync (shared row mapping)
-  server.js        # MCP server factory: 4 resources + 10 tools
+  server.js        # MCP server factory: 4 resources + 12 tools
   bin/
     stdio.js       # stdio transport entry point
     cli.js         # CLI: init, refresh, serve
 test/
-  *.test.js        # node:test suite (135 tests)
+  *.test.js        # node:test suite (149 tests)
   fixtures/
     monarch.db     # Committed 5-row fixture DB
     create-fixture-db.js  # Regenerates the fixture
@@ -35,7 +35,7 @@ test/
 ## Running Tests
 
 ```bash
-npm test                          # All 135 tests
+npm test                          # All 149 tests
 node --test test/db.test.js       # Single file
 ```
 
@@ -61,6 +61,7 @@ Read:
 - `query_transactions(sql)` — Read-only SQL (SELECT/WITH only)
 - `refresh_transactions(mode)` — `recent` (3 months) or `full` (all history)
 - `list_rules()` — All TransactionRuleV2 rules (live API read)
+- `get_budget(startMonth?, endMonth?)` — Budget for a month range (live API read): planned/actual/remaining per category + group, flex totals, month totals, goal contributions; category/group names resolved
 
 Write (mutate the LIVE Monarch account; agents must confirm with the user first):
 
@@ -69,6 +70,7 @@ Write (mutate the LIVE Monarch account; agents must confirm with the user first)
 - `create_tag(name, color?)` — returns created tag with ID
 - `set_transaction_tags(transactionId, tagIds)` — replaces the full tag set
 - `create_rule(...)` / `update_rule(id, ...)` / `delete_rule(id)` — TransactionRuleV2 CRUD
+- `set_budget_amount(amount, month, categoryId|categoryGroupId|flex, applyToFuture?)` — set a planned monthly budget amount
 
 Transaction write tools self-verify (`src/mirror.js`): after the mutation they re-fetch the
 transaction via `getTransaction`, verify the requested changes took effect, and upsert the live
@@ -84,6 +86,8 @@ exercise writes must point `MONARCH_DATA_DIR` at a temp COPY of the fixture DB, 
 committed fixture.
 
 Write-tool conventions (`src/api.js`): endpoint `https://api.monarch.com/graphql`, header `Authorization: Token <token>` (not Bearer) + `Client-Platform: web`. Payload-level `errors` arrays are surfaced as thrown errors. Never log or echo the token.
+
+Budget tools (`get_budget` / `set_budget_amount`): budgets have NO mirror table — both tools hit the live API directly. Amounts use the positive-spend convention (planned 445 = plan to spend $445), the opposite of transaction amounts. `set_budget_amount` targets exactly one of a category (`updateOrCreateBudgetItem` with `timeframe: "month"`), a group (requires `groupLevelBudgetingEnabled` on the group), or the household flex budget (`updateOrCreateFlexBudgetItem`, fixed_and_flex system only), then self-verifies by re-reading `budgetData` for that month and comparing the planned amount. GraphQL operations were extracted from the Monarch web app JS bundle (introspection is disabled server-side); the read path was verified against the live API 2026-07-18. Full operation catalog (incl. rollovers, savings-goal/debt-paydown budget amounts, budget settings — not yet exposed as tools) is documented in monarch_chrome_extension `docs/api-reference.md`.
 
 Rule API quirks (both verified live 2026-07-15): (1) `deleteTransactionRule` returns `deleted: false` even on successful deletes — `deleteRule` treats the absence of payload errors as success and only echoes the raw field as `apiDeletedField`. (2) `updateTransactionRuleV2` silently ignores partial inputs while reporting success — `update_rule` therefore does fetch-merge-write: it loads the rule via `getRules`, merges the caller's fields over the full current state, converts read shapes to write shapes (`setCategoryAction` object → category ID, `setMerchantAction` object → merchant NAME, `addTagsAction` objects → tag IDs), and sends the complete input. Fields outside the `getRules` selection (goal-link, business-entity, notification, needs-review-by-user actions) are not round-tripped.
 

@@ -17,7 +17,7 @@ import {
 } from './mirror.js';
 
 export const SERVER_NAME = 'monarch-money';
-export const SERVER_VERSION = '0.6.1';
+export const SERVER_VERSION = '0.7.0';
 
 /**
  * Standard suffix for write tool descriptions (rules/tags — writes whose
@@ -91,6 +91,11 @@ export function createServer() {
         'says so and the mirror is stale for that transaction until refresh_transactions is run. ' +
         'Rule writes (especially applyToExistingTransactions) can change many transactions at ' +
         'once and still require refresh_transactions to update the mirror. ' +
+        'BUDGETS: get_budget reads planned/actual/remaining amounts per category and group ' +
+        'from the live API; set_budget_amount sets a planned monthly amount (category, group, ' +
+        'or flex) and self-verifies by re-reading the live budget — budgets are not in the ' +
+        'local mirror, so no refresh is involved. Budget amounts are positive-spend ' +
+        '(planned 445 = spend $445), unlike transaction amounts. ' +
         'Transaction/category/tag IDs come from the local mirror (query_transactions and ' +
         'monarch:// resources); rule IDs come from list_rules.\n\n' +
         'The transactions table has columns: id, amount, date, merchant_name, plaid_name, ' +
@@ -244,6 +249,206 @@ function registerTools(server) {
   );
 
   registerWriteTools(server);
+  registerBudgetTools(server);
+}
+
+// ─── Budget tools (live API; no mirror table for budgets) ───────────────
+
+/** Normalize "YYYY-MM" or "YYYY-MM-DD" to the first of the month. */
+function toMonthStart(value) {
+  const m = /^(\d{4})-(\d{2})(?:-\d{2})?$/.exec(value);
+  if (!m) throw new Error(`Invalid month "${value}" — use YYYY-MM or YYYY-MM-DD.`);
+  return `${m[1]}-${m[2]}-01`;
+}
+
+/**
+ * Reshape the raw Common_BudgetDataQuery response into a compact structure
+ * with category/group names resolved (the raw response keys budget rows by
+ * bare category IDs).
+ */
+function shapeBudget(data) {
+  const categoryIndex = new Map();
+  const groupIndex = new Map();
+  for (const group of data.categoryGroups ?? []) {
+    groupIndex.set(group.id, group);
+    for (const cat of group.categories ?? []) {
+      categoryIndex.set(cat.id, { ...cat, groupId: group.id, groupName: group.name });
+    }
+  }
+
+  const compactMonths = (monthlyAmounts) => (monthlyAmounts ?? []).map(m => {
+    const out = {
+      month: m.month,
+      planned: m.plannedCashFlowAmount,
+      actual: m.actualAmount,
+      remaining: m.remainingAmount,
+    };
+    if (m.plannedSetAsideAmount) out.plannedSetAside = m.plannedSetAsideAmount;
+    if (m.rolloverType) {
+      out.rolloverType = m.rolloverType;
+      out.priorRollover = m.previousMonthRolloverAmount;
+      out.cumulativeActual = m.cumulativeActualAmount;
+      if (m.rolloverTargetAmount != null) out.rolloverTarget = m.rolloverTargetAmount;
+    }
+    return out;
+  });
+
+  return {
+    budgetSystem: data.budgetSystem,
+    budgetStatus: data.budgetStatus,
+    totalsByMonth: data.budgetData?.totalsByMonth ?? [],
+    categories: (data.budgetData?.monthlyAmountsByCategory ?? []).map(row => {
+      const cat = categoryIndex.get(row.category.id);
+      return {
+        categoryId: row.category.id,
+        name: cat?.name ?? null,
+        group: cat?.groupName ?? null,
+        groupId: cat?.groupId ?? null,
+        variability: cat?.budgetVariability ?? null,
+        excludeFromBudget: cat?.excludeFromBudget || undefined,
+        months: compactMonths(row.monthlyAmounts),
+      };
+    }),
+    categoryGroups: (data.budgetData?.monthlyAmountsByCategoryGroup ?? []).map(row => {
+      const group = groupIndex.get(row.categoryGroup.id);
+      return {
+        categoryGroupId: row.categoryGroup.id,
+        name: group?.name ?? null,
+        type: group?.type ?? null,
+        variability: group?.budgetVariability ?? null,
+        groupLevelBudgetingEnabled: group?.groupLevelBudgetingEnabled ?? null,
+        months: compactMonths(row.monthlyAmounts),
+      };
+    }),
+    flexExpense: data.budgetData?.monthlyAmountsForFlexExpense
+      ? {
+          budgetVariability: data.budgetData.monthlyAmountsForFlexExpense.budgetVariability,
+          months: compactMonths(data.budgetData.monthlyAmountsForFlexExpense.monthlyAmounts),
+        }
+      : null,
+    goals: (data.goalsV2 ?? [])
+      .filter(g => !g.archivedAt)
+      .map(g => ({
+        goalId: g.id,
+        name: g.name,
+        plannedContributions: g.plannedContributions ?? [],
+        actualContributionsByMonth: g.monthlyContributionSummaries ?? [],
+      })),
+  };
+}
+
+function registerBudgetTools(server) {
+
+  server.registerTool(
+    'get_budget',
+    {
+      description: 'Fetch the Monarch budget from the live API for a month range: planned vs ' +
+        'actual vs remaining amounts per category, per category group, flex-expense totals ' +
+        '(fixed_and_flex budget system), month totals, and goal contributions. Months are ' +
+        'YYYY-MM or YYYY-MM-DD (day is ignored; budgets are monthly). Omit both to get the ' +
+        'current month. Read-only. NOTE: budget amounts use a positive-spend convention ' +
+        '(planned 445 = plan to spend $445), unlike the transactions table where expenses ' +
+        'are negative.',
+      inputSchema: z.object({
+        startMonth: z.string().optional()
+          .describe('First month of the range, YYYY-MM or YYYY-MM-DD (defaults to the current month)'),
+        endMonth: z.string().optional()
+          .describe('Last month of the range (defaults to startMonth)'),
+      }),
+    },
+    writeHandler(async (token, { startMonth, endMonth }) => {
+      const start = toMonthStart(startMonth ?? new Date().toISOString().slice(0, 10));
+      const end = toMonthStart(endMonth ?? start);
+      const data = await api.getBudgetData(token, start, end);
+      return shapeBudget(data);
+    })
+  );
+
+  server.registerTool(
+    'set_budget_amount',
+    {
+      description: 'Set the planned monthly budget amount for a category, a category group ' +
+        '(group-level budgeting), or the household flex-expense budget (fixed_and_flex ' +
+        'system). Provide exactly one of categoryId / categoryGroupId / flex. Amounts use ' +
+        'the positive-spend convention (445 = budget $445 of spending). After the write, the ' +
+        'tool re-reads the budget for that month from the live API and verifies the planned ' +
+        'amount took effect — check `verification` in the result. ' +
+        'WRITES TO THE LIVE MONARCH ACCOUNT — confirm with the user before calling. ' +
+        '(Budgets are not part of the local SQLite mirror, so no refresh is needed.)',
+      inputSchema: z.object({
+        amount: z.number().describe('Planned amount in dollars (positive-spend convention)'),
+        month: z.string().describe('Budget month, YYYY-MM or YYYY-MM-DD'),
+        categoryId: z.string().optional()
+          .describe('Category ID to budget (see monarch://categories or get_budget)'),
+        categoryGroupId: z.string().optional()
+          .describe('Category group ID — only for groups with groupLevelBudgetingEnabled'),
+        flex: z.boolean().optional()
+          .describe('true = set the household flex-expense budget instead of a category'),
+        applyToFuture: z.boolean().default(false)
+          .describe('Also apply this amount to all future months'),
+      }),
+    },
+    writeHandler(async (token, { amount, month, categoryId, categoryGroupId, flex, applyToFuture }) => {
+      const targets = [categoryId, categoryGroupId, flex ? 'flex' : undefined]
+        .filter(t => t !== undefined);
+      if (targets.length !== 1) {
+        throw new Error('Provide exactly one of: categoryId, categoryGroupId, or flex: true.');
+      }
+      const startDate = toMonthStart(month);
+
+      let budgetItem;
+      if (flex) {
+        budgetItem = await api.updateFlexBudgetItem(token, {
+          startDate, amount, applyToFuture,
+        });
+      } else {
+        budgetItem = await api.updateBudgetItem(token, {
+          startDate,
+          timeframe: 'month',
+          amount,
+          applyToFuture,
+          categoryId,
+          categoryGroupId,
+        });
+      }
+
+      // Read-back verification against the live budget for that month.
+      let verification;
+      try {
+        const data = await api.getBudgetData(token, startDate, startDate);
+        let live;
+        if (flex) {
+          live = data.budgetData?.monthlyAmountsForFlexExpense?.monthlyAmounts
+            ?.find(m => m.month === startDate);
+        } else {
+          const rows = categoryId
+            ? data.budgetData?.monthlyAmountsByCategory
+            : data.budgetData?.monthlyAmountsByCategoryGroup;
+          const row = (rows ?? []).find(r =>
+            (categoryId ? r.category?.id === categoryId : r.categoryGroup?.id === categoryGroupId));
+          live = row?.monthlyAmounts?.find(m => m.month === startDate);
+        }
+        const livePlanned = live?.plannedCashFlowAmount;
+        verification = livePlanned === amount
+          ? { verified: true }
+          : {
+              verified: false,
+              livePlanned: livePlanned ?? null,
+              warning: 'The write returned success but the live planned amount for ' +
+                `${startDate} reads back as ${livePlanned ?? 'missing'} instead of ${amount}. ` +
+                'Check the target ID (group targets require groupLevelBudgetingEnabled) and ' +
+                'inform the user.',
+            };
+      } catch (err) {
+        verification = {
+          verified: false,
+          warning: `The write succeeded but the read-back failed (${err.message}).`,
+        };
+      }
+
+      return { budgetItem, verification };
+    })
+  );
 }
 
 // ─── Write tools (live Monarch API mutations) ───────────────────────────
