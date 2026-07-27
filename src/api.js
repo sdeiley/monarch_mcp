@@ -437,3 +437,90 @@ export async function deleteRule(token, id) {
   assertNoPayloadErrors(result, 'deleteRule');
   return { deleted: true, apiDeletedField: result.deleted ?? null };
 }
+
+// ─── Recurring streams (read-only) ───────────────────────────────────────
+//
+// Monarch models recurring as first-class merchant-level streams
+// (RecurringTransactionStream: frequency, expected amount, baseDate,
+// reviewStatus, isActive); each transaction's isRecurring boolean is derived
+// from stream membership. Documents extracted from the web app's JS bundle
+// (introspection is disabled) and validated live 2026-07-27.
+
+/**
+ * Fetch recurring stream metadata: review status, frequency, expected
+ * amount, base date, and recurring type per stream. (The web app's
+ * Common_GetRecurringStreams — the Recurring settings list.)
+ * @returns {Promise<Array>} [{ stream: {...} }]
+ */
+export async function getRecurringStreams(token) {
+  const data = await graphqlRequest(token, `
+    query Common_GetRecurringStreams($includeLiabilities: Boolean) {
+      recurringTransactionStreams(includePending: true, includeLiabilities: $includeLiabilities) {
+        stream {
+          id reviewStatus frequency amount baseDate dayOfTheMonth isApproximate
+          name logoUrl recurringType
+          merchant { id }
+          creditReportLiabilityAccount { id account { id } lastStatement { id dueDate } }
+        }
+      }
+    }
+  `, { includeLiabilities: true });
+  return data.recurringTransactionStreams;
+}
+
+/**
+ * Fetch recurring streams with their next forecasted occurrence, category,
+ * and account. (The web app's Common_GetAllRecurringTransactionItems.)
+ * @returns {Promise<Array>} [{ stream, nextForecastedTransaction, category, account }]
+ */
+export async function getRecurringStreamsOverview(token) {
+  const data = await graphqlRequest(token, `
+    query Common_GetAllRecurringTransactionItems($includeLiabilities: Boolean, $includePending: Boolean) {
+      recurringTransactionStreams(includeLiabilities: $includeLiabilities, includePending: $includePending) {
+        stream {
+          id frequency isActive isApproximate name
+          merchant { id name }
+          creditReportLiabilityAccount { id account { id } }
+        }
+        nextForecastedTransaction { date amount }
+        category { id name }
+        account { id displayName }
+      }
+    }
+  `, { includeLiabilities: true, includePending: true });
+  return data.recurringTransactionStreams;
+}
+
+/**
+ * Fetch per-occurrence recurring items in a date range, grouped by status
+ * (upcoming/complete), with per-item late/missed flags, matched transaction
+ * id, and expected-vs-actual amount diff. (The web app's
+ * Common_GetAggregatedRecurringItems — the Recurring calendar page.)
+ * @param {string} startDate - YYYY-MM-DD
+ * @param {string} endDate - YYYY-MM-DD
+ * @returns {Promise<object>} { groups, aggregatedSummary }
+ */
+export async function getRecurringItems(token, startDate, endDate) {
+  const data = await graphqlRequest(token, `
+    query Common_GetAggregatedRecurringItems($startDate: Date!, $endDate: Date!) {
+      aggregatedRecurringItems(startDate: $startDate, endDate: $endDate, groupBy: "status") {
+        groups {
+          groupBy { status }
+          results {
+            stream { id frequency isActive amount isApproximate name merchant { id name } }
+            date isPast isLate isMissed markedPaidAt isCompleted transactionId
+            amount amountDiff isAmountDifferentThanOriginal
+            category { id name }
+            account { id displayName }
+          }
+        }
+        aggregatedSummary {
+          expense { completed remaining total count pendingAmountCount }
+          creditCard { completed remaining total count pendingAmountCount }
+          income { completed remaining total }
+        }
+      }
+    }
+  `, { startDate, endDate });
+  return data.aggregatedRecurringItems;
+}

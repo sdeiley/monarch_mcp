@@ -17,7 +17,7 @@ import {
 } from './mirror.js';
 
 export const SERVER_NAME = 'monarch-money';
-export const SERVER_VERSION = '0.7.0';
+export const SERVER_VERSION = '0.8.0';
 
 /**
  * Standard suffix for write tool descriptions (rules/tags — writes whose
@@ -96,6 +96,11 @@ export function createServer() {
         'or flex) and self-verifies by re-reading the live budget — budgets are not in the ' +
         'local mirror, so no refresh is involved. Budget amounts are positive-spend ' +
         '(planned 445 = spend $445), unlike transaction amounts. ' +
+        'RECURRING: get_recurring reads Monarch\'s recurring streams (frequency, expected ' +
+        'amount, review status, next forecasted date, category, account) from the live API, ' +
+        'optionally with per-occurrence items (late/missed flags, matched transaction id, ' +
+        'expected-vs-actual amountDiff) for a date range — read-only; streams are not ' +
+        'mirrored, the mirror only has the derived per-transaction is_recurring flag. ' +
         'Transaction/category/tag IDs come from the local mirror (query_transactions and ' +
         'monarch:// resources); rule IDs come from list_rules.\n\n' +
         'The transactions table has columns: id, amount, date, merchant_name, plaid_name, ' +
@@ -250,6 +255,112 @@ function registerTools(server) {
 
   registerWriteTools(server);
   registerBudgetTools(server);
+  registerRecurringTools(server);
+}
+
+// ─── Recurring tools (live API; the mirror has only the per-txn is_recurring flag) ─
+
+/**
+ * Merge the two stream reads (metadata + forecast/category/account) into one
+ * row per stream, keyed by stream id.
+ */
+function shapeRecurringStreams(metaRows, overviewRows) {
+  const overviewById = new Map(
+    (overviewRows ?? []).map(row => [row.stream.id, row])
+  );
+  return (metaRows ?? []).map(({ stream }) => {
+    const overview = overviewById.get(stream.id);
+    return {
+      streamId: stream.id,
+      name: stream.name,
+      merchantId: stream.merchant?.id ?? null,
+      merchantName: overview?.stream.merchant?.name ?? null,
+      recurringType: stream.recurringType,
+      frequency: stream.frequency,
+      expectedAmount: stream.amount,
+      isApproximate: stream.isApproximate,
+      isActive: overview?.stream.isActive ?? null,
+      reviewStatus: stream.reviewStatus,
+      baseDate: stream.baseDate,
+      dayOfTheMonth: stream.dayOfTheMonth,
+      nextForecasted: overview?.nextForecastedTransaction ?? null,
+      category: overview?.category ?? null,
+      account: overview?.account ?? null,
+      isLiability: stream.creditReportLiabilityAccount != null || undefined,
+    };
+  });
+}
+
+/** Flatten the status-grouped items into one array with a status field. */
+function shapeRecurringItems(agg) {
+  const items = [];
+  for (const group of agg.groups ?? []) {
+    for (const r of group.results ?? []) {
+      items.push({
+        status: group.groupBy?.status ?? null,
+        date: r.date,
+        streamId: r.stream?.id ?? null,
+        name: r.stream?.name ?? null,
+        frequency: r.stream?.frequency ?? null,
+        expectedAmount: r.stream?.amount ?? null,
+        actualAmount: r.amount,
+        amountDiff: r.amountDiff,
+        transactionId: r.transactionId,
+        isPast: r.isPast,
+        isLate: r.isLate || undefined,
+        isMissed: r.isMissed || undefined,
+        isCompleted: r.isCompleted,
+        markedPaidAt: r.markedPaidAt ?? undefined,
+        category: r.category ?? null,
+        account: r.account ?? null,
+      });
+    }
+  }
+  items.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return { items, summary: agg.aggregatedSummary ?? null };
+}
+
+function registerRecurringTools(server) {
+
+  server.registerTool(
+    'get_recurring',
+    {
+      description: 'Fetch Monarch\'s recurring-transaction streams from the live API: one row ' +
+        'per detected recurring series (merchant, frequency, expected amount, review status, ' +
+        'active flag, next forecasted date, category, account). Monarch models recurring as ' +
+        'merchant-level streams; each transaction\'s is_recurring flag in the mirror is derived ' +
+        'from stream membership. Optionally pass startDate+endDate (YYYY-MM-DD) to also get ' +
+        'per-occurrence items in that range with late/missed flags, the matched transaction id, ' +
+        'and expected-vs-actual amountDiff — the raw material for auditing noisy or inaccurate ' +
+        'recurring detection. Read-only; streams are not in the local mirror.',
+      inputSchema: z.object({
+        startDate: z.string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/, 'startDate must be YYYY-MM-DD')
+          .optional()
+          .describe('Start of the per-occurrence items window (requires endDate)'),
+        endDate: z.string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/, 'endDate must be YYYY-MM-DD')
+          .optional()
+          .describe('End of the per-occurrence items window (requires startDate)'),
+      }),
+    },
+    writeHandler(async (token, { startDate, endDate }) => {
+      if ((startDate == null) !== (endDate == null)) {
+        throw new Error('Provide both startDate and endDate, or neither.');
+      }
+      const [metaRows, overviewRows] = await Promise.all([
+        api.getRecurringStreams(token),
+        api.getRecurringStreamsOverview(token),
+      ]);
+      const result = { streams: shapeRecurringStreams(metaRows, overviewRows) };
+      if (startDate != null) {
+        Object.assign(result, shapeRecurringItems(
+          await api.getRecurringItems(token, startDate, endDate)
+        ));
+      }
+      return result;
+    })
+  );
 }
 
 // ─── Budget tools (live API; no mirror table for budgets) ───────────────
