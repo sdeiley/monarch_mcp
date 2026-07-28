@@ -492,6 +492,48 @@ export async function getRecurringStreamsOverview(token) {
 }
 
 /**
+ * Review (approve/dismiss) a recurring stream, optionally correcting its
+ * expected amount/frequency/baseDate at the same time.
+ * Input shape from the bundle's embedded schema snapshot:
+ * ReviewRecurringStreamInput { streamId: ID!, reviewStatus: String!
+ * (approved|automatic_approved|ignored|pending), accountId: ID,
+ * amount: Float, baseDate: Date, dayOfTheMonth: String, frequency: String,
+ * isActive: Boolean }.
+ * @returns {Promise<object>} { id, reviewStatus } of the reviewed stream
+ */
+export async function reviewRecurringStream(token, input) {
+  const data = await graphqlRequest(token, `
+    mutation Common_ReviewStream($input: ReviewRecurringStreamInput!) {
+      reviewRecurringStream(input: $input) {
+        stream { id reviewStatus }
+        ${PAYLOAD_ERROR_FIELDS}
+      }
+    }
+  `, { input });
+  const result = data.reviewRecurringStream;
+  assertNoPayloadErrors(result, 'reviewRecurringStream');
+  return result.stream;
+}
+
+/**
+ * Remove a stream from Monarch's recurring list ("this is not recurring").
+ * @returns {Promise<{success: boolean}>}
+ */
+export async function markStreamAsNotRecurring(token, streamId) {
+  const data = await graphqlRequest(token, `
+    mutation Common_MarkAsNotRecurring($streamId: ID!) {
+      markStreamAsNotRecurring(streamId: $streamId) {
+        success
+        ${PAYLOAD_ERROR_FIELDS}
+      }
+    }
+  `, { streamId });
+  const result = data.markStreamAsNotRecurring;
+  assertNoPayloadErrors(result, 'markStreamAsNotRecurring');
+  return { success: result.success === true };
+}
+
+/**
  * Fetch per-occurrence recurring items in a date range, grouped by status
  * (upcoming/complete), with per-item late/missed flags, matched transaction
  * id, and expected-vs-actual amount diff. (The web app's

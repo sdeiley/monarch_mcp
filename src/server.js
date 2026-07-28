@@ -17,7 +17,7 @@ import {
 } from './mirror.js';
 
 export const SERVER_NAME = 'monarch-money';
-export const SERVER_VERSION = '0.8.0';
+export const SERVER_VERSION = '0.9.0';
 
 /**
  * Standard suffix for write tool descriptions (rules/tags — writes whose
@@ -26,6 +26,10 @@ export const SERVER_VERSION = '0.8.0';
 const WRITE_WARNING =
   ' WRITES TO THE LIVE MONARCH ACCOUNT — confirm with the user before calling. ' +
   'The local SQLite mirror becomes stale for affected transactions until refresh_transactions is run.';
+
+/** Suffix for stream write tools — streams have no mirror table to go stale. */
+const STREAM_WRITE_WARNING =
+  ' WRITES TO THE LIVE MONARCH ACCOUNT — confirm with the user before calling.';
 
 /**
  * Suffix for transaction write tools that self-verify: after the mutation
@@ -359,6 +363,104 @@ function registerRecurringTools(server) {
         ));
       }
       return result;
+    })
+  );
+
+  server.registerTool(
+    'review_recurring_stream',
+    {
+      description: 'Review a Monarch recurring stream: approve it, dismiss it (reviewStatus ' +
+        '"ignored"), or correct its expected amount / frequency / base date while approving. ' +
+        'Use get_recurring for stream IDs and current state. Self-verifies against the ' +
+        'mutation payload\'s returned reviewStatus. Streams are not in the local mirror, so ' +
+        'no refresh is involved.' +
+        STREAM_WRITE_WARNING,
+      inputSchema: z.object({
+        streamId: z.string().describe('Recurring stream ID (from get_recurring)'),
+        reviewStatus: z.enum(['approved', 'ignored'])
+          .describe('approved = confirm as recurring; ignored = dismiss the detection'),
+        amount: z.number().optional()
+          .describe('Correct the expected amount (signed like transactions: negative for expenses)'),
+        frequency: z.string().optional()
+          .describe('Correct the cadence, e.g. "weekly", "monthly", "yearly"'),
+        baseDate: z.string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/, 'baseDate must be YYYY-MM-DD')
+          .optional()
+          .describe('Correct the anchor date the cadence counts from'),
+        dayOfTheMonth: z.string().optional()
+          .describe('Correct the day-of-month for monthly streams'),
+        isActive: z.boolean().optional().describe('Activate/deactivate the stream'),
+      }),
+    },
+    writeHandler(async (token, { streamId, reviewStatus, amount, frequency, baseDate, dayOfTheMonth, isActive }) => {
+      const input = { streamId, reviewStatus };
+      if (amount !== undefined) input.amount = amount;
+      if (frequency !== undefined) input.frequency = frequency;
+      if (baseDate !== undefined) input.baseDate = baseDate;
+      if (dayOfTheMonth !== undefined) input.dayOfTheMonth = dayOfTheMonth;
+      if (isActive !== undefined) input.isActive = isActive;
+
+      const stream = await api.reviewRecurringStream(token, input);
+      const verification = stream?.reviewStatus === reviewStatus
+        ? { verified: true }
+        : {
+            verified: false,
+            liveReviewStatus: stream?.reviewStatus ?? null,
+            warning: `The mutation returned reviewStatus "${stream?.reviewStatus}" instead of ` +
+              `the requested "${reviewStatus}" — inform the user.`,
+          };
+      return { stream, verification };
+    })
+  );
+
+  server.registerTool(
+    'mark_stream_not_recurring',
+    {
+      description: 'Remove a stream from Monarch\'s recurring list ("this is not recurring"). ' +
+        'Use for stale or wrongly-detected streams. Self-verifies by re-fetching the stream ' +
+        'list and confirming the stream is gone. Streams are not in the local mirror, so no ' +
+        'refresh is involved; the derived per-transaction is_recurring flags update on ' +
+        'Monarch\'s side over time.' +
+        STREAM_WRITE_WARNING,
+      inputSchema: z.object({
+        streamId: z.string().describe('Recurring stream ID (from get_recurring)'),
+      }),
+    },
+    writeHandler(async (token, { streamId }) => {
+      const result = await api.markStreamAsNotRecurring(token, streamId);
+
+      // The resolver silently no-ops on unknown IDs (success=false, no
+      // error — verified live 2026-07-28), so success=false means the
+      // stream was not removed, even though it is absent from the list.
+      if (!result.success) {
+        return {
+          ...result,
+          verification: {
+            verified: false,
+            warning: `The API reported success=false for stream ${streamId} — it was not ` +
+              'removed (the ID may not exist; check get_recurring). Inform the user.',
+          },
+        };
+      }
+
+      let verification;
+      try {
+        const rows = await api.getRecurringStreams(token);
+        const stillThere = (rows ?? []).some(r => r.stream.id === streamId);
+        verification = stillThere
+          ? {
+              verified: false,
+              warning: `The mutation reported success but stream ${streamId} still appears ` +
+                'in the live stream list — inform the user.',
+            }
+          : { verified: true };
+      } catch (err) {
+        verification = {
+          verified: false,
+          warning: `The write succeeded but the stream-list read-back failed (${err.message}).`,
+        };
+      }
+      return { ...result, verification };
     })
   );
 }

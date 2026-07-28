@@ -208,3 +208,117 @@ describe('get_recurring', () => {
     assert.match(result.content[0].text, /both startDate and endDate/);
   });
 });
+
+describe('review_recurring_stream', () => {
+  const realFetch = globalThis.fetch;
+  let pair;
+
+  beforeEach(async () => { pair = await createTestPair(); });
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    await pair.close();
+  });
+
+  it('sends only provided fields and verifies the returned reviewStatus', async () => {
+    const calls = [];
+    installMockFetch(calls, {
+      reviewRecurringStream: { stream: { id: 's1', reviewStatus: 'approved' }, errors: null },
+    });
+
+    const result = parseResult(await pair.client.callTool({
+      name: 'review_recurring_stream',
+      arguments: { streamId: 's1', reviewStatus: 'approved', amount: -12.99 },
+    }));
+
+    assert.deepEqual(calls[0].body.variables.input,
+      { streamId: 's1', reviewStatus: 'approved', amount: -12.99 });
+    assert.equal(result.stream.reviewStatus, 'approved');
+    assert.equal(result.verification.verified, true);
+  });
+
+  it('flags a reviewStatus mismatch instead of claiming success', async () => {
+    installMockFetch([], {
+      reviewRecurringStream: { stream: { id: 's1', reviewStatus: 'pending' }, errors: null },
+    });
+
+    const result = parseResult(await pair.client.callTool({
+      name: 'review_recurring_stream',
+      arguments: { streamId: 's1', reviewStatus: 'ignored' },
+    }));
+
+    assert.equal(result.verification.verified, false);
+    assert.match(result.verification.warning, /"pending" instead of the requested "ignored"/);
+  });
+
+  it('surfaces payload errors as tool errors', async () => {
+    installMockFetch([], {
+      reviewRecurringStream: {
+        stream: null,
+        errors: [{ fieldErrors: null, message: 'Not found', code: 'not_found' }],
+      },
+    });
+
+    const result = await pair.client.callTool({
+      name: 'review_recurring_stream',
+      arguments: { streamId: 'bogus', reviewStatus: 'ignored' },
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /Not found/);
+  });
+});
+
+describe('mark_stream_not_recurring', () => {
+  const realFetch = globalThis.fetch;
+  let pair;
+
+  beforeEach(async () => { pair = await createTestPair(); });
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    await pair.close();
+  });
+
+  it('verifies removal by re-fetching the stream list', async () => {
+    const calls = [];
+    installMockFetch(calls,
+      { markStreamAsNotRecurring: { success: true, errors: null } },
+      // read-back: s1 gone, only s2 remains
+      { recurringTransactionStreams: [{ stream: { id: 's2' } }] });
+
+    const result = parseResult(await pair.client.callTool({
+      name: 'mark_stream_not_recurring', arguments: { streamId: 's1' },
+    }));
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].body.variables.streamId, 's1');
+    assert.equal(result.success, true);
+    assert.equal(result.verification.verified, true);
+  });
+
+  it('treats API success=false as not-removed without trusting the read-back', async () => {
+    const calls = [];
+    installMockFetch(calls, { markStreamAsNotRecurring: { success: false, errors: null } });
+
+    const result = parseResult(await pair.client.callTool({
+      name: 'mark_stream_not_recurring', arguments: { streamId: 'bogus' },
+    }));
+
+    assert.equal(calls.length, 1); // no read-back on failure
+    assert.equal(result.success, false);
+    assert.equal(result.verification.verified, false);
+    assert.match(result.verification.warning, /not removed/);
+  });
+
+  it('flags the stream still being present on read-back', async () => {
+    installMockFetch([],
+      { markStreamAsNotRecurring: { success: true, errors: null } },
+      { recurringTransactionStreams: [{ stream: { id: 's1' } }] });
+
+    const result = parseResult(await pair.client.callTool({
+      name: 'mark_stream_not_recurring', arguments: { streamId: 's1' },
+    }));
+
+    assert.equal(result.verification.verified, false);
+    assert.match(result.verification.warning, /still appears/);
+  });
+});

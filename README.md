@@ -111,6 +111,8 @@ The server exposes 4 read-only resources:
 | `get_budget` | Budget for a month range: planned/actual/remaining per category and group, flex totals, goal contributions (live API read) |
 | `set_budget_amount` | Set the planned monthly budget amount for a category, group, or the flex budget (write) |
 | `get_recurring` | Recurring streams (frequency, expected amount, review status, next forecasted date, category, account); optional date range adds per-occurrence items with late/missed flags and expected-vs-actual amount diffs (live API read) |
+| `review_recurring_stream` | Approve or dismiss a recurring stream, optionally correcting its expected amount/frequency/base date (write) |
+| `mark_stream_not_recurring` | Remove a stream from the recurring list; self-verifies the stream is gone from the live list (write) |
 
 ### Write tools
 
@@ -125,7 +127,7 @@ Notes:
 - Rule create/update mutations return no rule entity (Monarch API limitation); use `list_rules` to confirm.
 - `update_rule` genuinely supports partial updates: the Monarch update mutation silently ignores partial inputs (while reporting success), so the tool fetches the rule's current state, merges your fields over it, converts read shapes to write shapes (category/tag objects → IDs, merchant object → name), and sends the complete input. Goal-link, business-entity, notification, and needs-review-by-user actions are not round-tripped and may be reset by an update.
 - `delete_rule` treats the absence of API errors as success: Monarch's `deleted` response field is unreliable (it reports `false` even for successful deletes) and is echoed only as `apiDeletedField` for debugging.
-- Recurring streams have no local mirror table — `get_recurring` reads the live API (Monarch models recurring as merchant-level `RecurringTransactionStream`s; the mirror's per-transaction `is_recurring` flag is derived from stream membership). Read-only: stream mutations (approve/dismiss/mark-not-recurring) exist in the API but are not yet exposed as tools.
+- Recurring streams have no local mirror table — all three recurring tools talk to the live API (Monarch models recurring as merchant-level `RecurringTransactionStream`s; the mirror's per-transaction `is_recurring` flag is derived from stream membership). The stream write tools self-verify: `review_recurring_stream` checks the mutation's returned `reviewStatus`, and `mark_stream_not_recurring` re-fetches the stream list and confirms the stream is gone. Note: Monarch's stream resolvers silently no-op on unknown IDs (no GraphQL error; `success: false` / `stream: null`) — both tools surface that as a failed `verification` rather than success.
 - Budgets have no local mirror table — `get_budget` and `set_budget_amount` both talk to the live API. Budget amounts use the **positive-spend** convention (planned `445` = plan to spend $445), the opposite of transaction amounts. `set_budget_amount` self-verifies by re-reading the month's budget after the write and comparing the planned amount (`verification.verified` in the result). Group-level targets require `groupLevelBudgetingEnabled` on the group; `flex: true` requires the fixed_and_flex budget system.
 
 ### Transaction Table Columns

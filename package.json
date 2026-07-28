@@ -1,6 +1,6 @@
 {
   "name": "monarch-mcp",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "MCP server for Monarch Money personal finance data",
   "type": "module",
   "main": "src/server.js",
